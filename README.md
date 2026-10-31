@@ -37,12 +37,18 @@ source .venv/bin/activate
 uv pip install numpy scipy
 ```
 
-### 3. Run the Digital Twin Physiology Simulation
+### 3. Run the Digital Twin Physiology Simulation (Step 1)
 ```bash
 python demo_simulation.py
 ```
 
-### 4. Run Verification Tests
+### 4. Run FSM Controllers & Safety Filter Demo (Step 2)
+```bash
+python demo_step2_controllers.py
+```
+
+### 5. Run Verification Tests
 ```bash
 python tests/test_physiology.py
+python tests/test_controllers.py
 ```
