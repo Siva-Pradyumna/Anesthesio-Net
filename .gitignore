@@ -1,0 +1,29 @@
+# Virtual Environment
+.venv/
+env/
+venv/
+ENV/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Data & Models
+*.parquet
+*.csv.gz
+*.pth
+*.pt
+checkpoints/
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Telemetry & Logs
+logs/
+*.log
