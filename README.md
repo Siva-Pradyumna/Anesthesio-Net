@@ -46,6 +46,7 @@ python evaluate.py
 # Or evaluate a specific milestone:
 python evaluate.py --step 1   # Mode A Digital Twin (Synergy, Mass Balance, Hemodynamics)
 python evaluate.py --step 2   # FSM, Gym Env, 30s Hysteresis & HOCBF Safety Filter
+python evaluate.py --step 3   # Mode B VitalDB Replay, Signal Filter & Counterfactual DR-OPE
 ```
 
 ### 4. Interactive Simulation Demos
@@ -55,10 +56,14 @@ python demo_simulation.py
 
 # Step 2: FSM transitions, incision clearance, and HOCBF overdose interception
 python demo_step2_controllers.py
+
+# Step 3: VitalDB replay, Bovie RF noise rejection, Sensor Hold mode, and Shadow CF
+python demo_step3_vitaldb_replay.py
 ```
 
 ### 5. Run Verification Tests
 ```bash
 python tests/test_physiology.py
 python tests/test_controllers.py
+python tests/test_signal_replay.py
 ```
