@@ -47,9 +47,10 @@ python evaluate.py
 python evaluate.py --step 1   # Mode A Digital Twin (Synergy, Mass Balance, Hemodynamics)
 python evaluate.py --step 2   # FSM, Gym Env, 30s Hysteresis & HOCBF Safety Filter
 python evaluate.py --step 3   # Mode B VitalDB Replay, Signal Filter & Counterfactual DR-OPE
+python evaluate.py --step 4   # Conformal Risk Bounds, Preload Gate, Watchdog & Web Server
 ```
 
-### 4. Interactive Simulation Demos
+### 4. Interactive Demos & Clinical Dashboard
 ```bash
 # Step 1: Digital twin live telemetry simulation
 python demo_simulation.py
@@ -59,6 +60,10 @@ python demo_step2_controllers.py
 
 # Step 3: VitalDB replay, Bovie RF noise rejection, Sensor Hold mode, and Shadow CF
 python demo_step3_vitaldb_replay.py
+
+# Step 4: Launch the Live Clinical Web Workstation (Multi-Suite Dashboard)
+python demo_step4_predictive_dashboard.py
+# Open your browser to: http://127.0.0.1:8000
 ```
 
 ### 5. Run Verification Tests
@@ -66,4 +71,5 @@ python demo_step3_vitaldb_replay.py
 python tests/test_physiology.py
 python tests/test_controllers.py
 python tests/test_signal_replay.py
+python tests/test_step4.py
 ```

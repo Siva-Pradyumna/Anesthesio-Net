@@ -15,7 +15,7 @@ from pathlib import Path
 # Ensure root path is imported
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from anesthesionet.evaluation import evaluate_step1, evaluate_step2, evaluate_step3
+from anesthesionet.evaluation import evaluate_step1, evaluate_step2, evaluate_step3, evaluate_step4
 
 
 def main():
@@ -25,9 +25,9 @@ def main():
     parser.add_argument(
         "--step",
         type=int,
-        choices=[1, 2, 3],
+        choices=[1, 2, 3, 4],
         default=None,
-        help="Specify which development step to evaluate (1, 2, or 3). Defaults to all."
+        help="Specify which development step to evaluate (1, 2, 3, or 4). Defaults to all."
     )
     parser.add_argument(
         "--all",
@@ -52,14 +52,19 @@ def main():
     elif args.step == 3:
         res3 = evaluate_step3()
         overall_results["Step 3 (VitalDB Replay & Signal Filter)"] = all(res3.values())
+    elif args.step == 4:
+        res4 = evaluate_step4()
+        overall_results["Step 4 (Predictive AI, Preload & Server)"] = all(res4.values())
     else:
         # Default: run all completed steps
         res1 = evaluate_step1()
         res2 = evaluate_step2()
         res3 = evaluate_step3()
+        res4 = evaluate_step4()
         overall_results["Step 1 (Digital Twin Physiology)"] = all(res1.values())
         overall_results["Step 2 (FSM, Gym Env & HOCBF Safety)"] = all(res2.values())
         overall_results["Step 3 (VitalDB Replay & Signal Filter)"] = all(res3.values())
+        overall_results["Step 4 (Predictive AI, Preload & Server)"] = all(res4.values())
 
     print("\n" + "=" * 80)
     print("                     EXECUTIVE EVALUATION SUMMARY")
