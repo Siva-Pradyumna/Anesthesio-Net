@@ -143,23 +143,24 @@ class FullLifecycleController:
 
     def _default_maintenance_policy(self, vitals: PatientVitals) -> np.ndarray:
         """
-        Proportional closed-loop maintenance policy targeting BIS = 50 and MAP = 75.
+        Proportional closed-loop maintenance policy targeting BIS = 50 and MAP = 75
+        using synergistic Propofol-Remifentanil balance.
         """
         bis_error = vitals.bis - 50.0
         map_error = 75.0 - vitals.map_mmhg
 
-        # Propofol adjustment
-        prop_rate = 4.0 + 0.15 * bis_error
-        # Remifentanil adjustment
-        remi_rate = 0.20 + 0.005 * bis_error
+        # Clinically synergistic maintenance rates (Propofol ~3.2-3.8, Remi ~0.10-0.15)
+        prop_rate = 3.5 + 0.15 * bis_error
+        remi_rate = 0.12 + 0.005 * bis_error
+        
         # Norepinephrine adjustment
         norepi_rate = 0.0
         if map_error > 5.0:
             norepi_rate = 0.02 + 0.005 * map_error
 
         return np.array([
-            np.clip(prop_rate, 1.0, 8.0),
-            np.clip(remi_rate, 0.05, 0.5),
+            np.clip(prop_rate, 1.0, 7.0),
+            np.clip(remi_rate, 0.04, 0.35),
             np.clip(norepi_rate, 0.0, 0.15)
         ], dtype=np.float32)
 

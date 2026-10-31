@@ -37,13 +37,23 @@ source .venv/bin/activate
 uv pip install numpy scipy
 ```
 
-### 3. Run the Digital Twin Physiology Simulation (Step 1)
+### 3. Master Clinical Evaluation & Benchmark Harness
+You can evaluate any or all development stages at any point:
 ```bash
-python demo_simulation.py
+# Evaluate all completed steps with clinical scorecards
+python evaluate.py
+
+# Or evaluate a specific milestone:
+python evaluate.py --step 1   # Mode A Digital Twin (Synergy, Mass Balance, Hemodynamics)
+python evaluate.py --step 2   # FSM, Gym Env, 30s Hysteresis & HOCBF Safety Filter
 ```
 
-### 4. Run FSM Controllers & Safety Filter Demo (Step 2)
+### 4. Interactive Simulation Demos
 ```bash
+# Step 1: Digital twin live telemetry simulation
+python demo_simulation.py
+
+# Step 2: FSM transitions, incision clearance, and HOCBF overdose interception
 python demo_step2_controllers.py
 ```
 

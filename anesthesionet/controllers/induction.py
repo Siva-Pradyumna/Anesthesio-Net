@@ -13,10 +13,10 @@ from anesthesionet.physiology.simulator import PatientVitals
 
 @dataclass
 class InductionConfig:
-    target_ce_prop: float = 3.5          # Target Propofol Ce (ug/mL)
-    target_ce_remi: float = 2.5          # Target Remifentanil Ce (ng/mL)
-    max_prop_rate: float = 12.0          # Max pump rate during induction (mg/kg/h)
-    max_remi_rate: float = 0.5           # Max remi rate during induction (ug/kg/min)
+    target_ce_prop: float = 2.2          # Clinically synergistic Propofol Ce target (ug/mL)
+    target_ce_remi: float = 1.5          # Clinically synergistic Remifentanil Ce target (ng/mL)
+    max_prop_rate: float = 10.0          # Max pump rate during induction (mg/kg/h)
+    max_remi_rate: float = 0.4           # Max remi rate during induction (ug/kg/min)
     dwell_duration_sec: float = 30.0     # Required continuous stable duration
     bis_target_min: float = 40.0         # Lower BIS target
     bis_target_max: float = 60.0         # Upper BIS target
@@ -50,8 +50,8 @@ class InductionController:
         Calculates and returns the initial induction bolus dose (mg) of Propofol.
         Transitions state to TCI_RAMPING.
         """
-        # Standard clinical induction bolus: ~1.5 to 1.8 mg/kg
-        bolus_mg = 1.7 * self.patient.weight_kg
+        # Clinical co-induction bolus with Remifentanil synergy: ~1.4 to 1.6 mg/kg
+        bolus_mg = 1.45 * self.patient.weight_kg
         self.initial_bolus_given = True
         self.state = "TCI_RAMPING"
         self.consecutive_dwell_sec = 0.0
@@ -92,18 +92,17 @@ class InductionController:
                 self.consecutive_dwell_sec = 0.0
 
         # 3. Closed-Loop TCI Rate Calculations
-        # Proportional-Integral feedback toward effect-site targets
+        # Proportional feedback toward synergistic effect-site targets
         prop_error = cfg.target_ce_prop - vitals.ce_propofol_ug_ml
         remi_error = cfg.target_ce_remi - vitals.ce_remi_ng_ml
 
-        # Maintenance basal rate + error adjustment
         if self.state in ["TCI_RAMPING", "LOC_CONFIRMED"]:
-            prop_rate = 6.0 + 3.0 * prop_error
-            remi_rate = 0.2 + 0.15 * remi_error
+            prop_rate = 5.0 + 2.5 * prop_error
+            remi_rate = 0.15 + 0.1 * remi_error
         else:
             # Steady-state dwell maintenance
-            prop_rate = 4.5 + 2.0 * prop_error
-            remi_rate = 0.15 + 0.1 * remi_error
+            prop_rate = 3.5 + 1.5 * prop_error
+            remi_rate = 0.12 + 0.05 * remi_error
 
         # Hemodynamic guardrail: if MAP approaches 65, add micro-pressor
         norepi_rate = 0.0
