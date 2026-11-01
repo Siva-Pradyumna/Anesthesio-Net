@@ -165,8 +165,10 @@ def create_app() -> FastAPI:
 
     # Prime OR-1 to Maintenance stage
     suites["OR-1"].controller.stage = SurgicalStage.STAGE_2_MAINTENANCE
-    suites["OR-1"].engine.simulator.pk_prop.state[0] = 16.0  # Therapeutic effect site
+    suites["OR-1"].engine.simulator.pk_prop.state[0] = 16.0
+    suites["OR-1"].engine.simulator.pk_prop.state[3] = 2.2  # Ce Propofol = 2.2 ug/mL (Therapeutic)
     suites["OR-1"].engine.simulator.pk_remi.state[0] = 7.0
+    suites["OR-1"].engine.simulator.pk_remi.state[3] = 1.5  # Ce Remifentanil = 1.5 ng/mL (Therapeutic)
 
     @app.get("/", response_class=HTMLResponse)
     async def get_dashboard():
@@ -176,17 +178,27 @@ def create_app() -> FastAPI:
     async def get_status():
         return {suite_id: s.step() for suite_id, s in suites.items()}
 
+    @app.get("/api/telemetry/{suite_id}")
+    async def get_suite_telemetry(suite_id: str):
+        suite = suites.get(suite_id, suites["OR-1"])
+        return suite.step()
+
     @app.websocket("/ws/telemetry/{suite_id}")
     async def websocket_telemetry(websocket: WebSocket, suite_id: str):
         await websocket.accept()
         suite = suites.get(suite_id, suites["OR-1"])
         try:
             while True:
-                payload = suite.step()
-                await websocket.send_text(json.dumps(payload))
+                try:
+                    payload = suite.step()
+                    await websocket.send_text(json.dumps(payload, default=float))
+                except Exception as step_err:
+                    print(f"[WebSocket Error] Suite {suite_id}: {step_err}")
                 await asyncio.sleep(0.5)  # 2 Hz telemetry broadcast
         except WebSocketDisconnect:
             pass
+        except Exception as ws_err:
+            print(f"[WebSocket Fatal] Suite {suite_id}: {ws_err}")
 
     return app
 
@@ -356,8 +368,8 @@ HTML_DASHBOARD_TEMPLATE = """
             <button class="tab-btn" onclick="switchSuite('OR-2')">SUITE 2 (OR-2)</button>
             <button class="tab-btn" onclick="switchSuite('OR-3')">SUITE 3 (OR-3)</button>
         </div>
-        <div style="font-size: 0.85rem; color: var(--green);">
-            ● CENTRAL CO-PILOT ONLINE
+        <div id="conn-badge" style="font-size: 0.85rem; color: var(--amber); font-weight: 600;">
+            ● INITIALIZING TELEMETRY STREAM...
         </div>
     </header>
 
@@ -371,31 +383,39 @@ HTML_DASHBOARD_TEMPLATE = """
             <div class="vitals-banner">
                 <div class="vital-box">
                     <div style="font-size: 0.8rem; color: var(--text-muted);">BISPECTRAL INDEX</div>
-                    <div class="vital-num bis-color" id="val-bis">49.2</div>
+                    <div class="vital-num bis-color" id="val-bis">--</div>
                     <div style="font-size: 0.75rem; color: var(--green);">Target: 40 - 60</div>
                 </div>
                 <div class="vital-box">
                     <div style="font-size: 0.8rem; color: var(--text-muted);">MEAN ARTERIAL PRESSURE</div>
-                    <div class="vital-num map-color" id="val-map">75.4</div>
+                    <div class="vital-num map-color" id="val-map">--</div>
                     <div style="font-size: 0.75rem; color: var(--green);">Target: 65 - 100 mmHg</div>
                 </div>
                 <div class="vital-box">
                     <div style="font-size: 0.8rem; color: var(--text-muted);">HEART RATE</div>
-                    <div class="vital-num hr-color" id="val-hr">68.0</div>
+                    <div class="vital-num hr-color" id="val-hr">--</div>
                     <div style="font-size: 0.75rem; color: var(--text-muted);">bpm (Sinus)</div>
                 </div>
                 <div class="vital-box">
                     <div style="font-size: 0.8rem; color: var(--text-muted);">PULSE PRESSURE VAR (PPV)</div>
-                    <div class="vital-num ppv-color" id="val-ppv">9.2%</div>
+                    <div class="vital-num ppv-color" id="val-ppv">--</div>
                     <div style="font-size: 0.75rem; color: var(--green);">Normovolemic (<13%)</div>
                 </div>
             </div>
 
-            <div style="font-size: 0.9rem; font-weight: 600; margin-bottom: 6px;">Live Physiological Waveform & Conformal Predictive Bands (10-Min Horizon)</div>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                <div style="font-size: 0.9rem; font-weight: 600;">Live Waveform & Conformal Predictive Risk Bands (10-Min Horizon)</div>
+                <div style="font-size: 0.75rem; color: var(--text-muted); display: flex; gap: 14px;">
+                    <span style="color: #38bdf8;">— BIS (Depth)</span>
+                    <span style="color: #f43f5e;">— MAP (Hemodynamics)</span>
+                    <span style="color: #10b981;">░ Target (40-60)</span>
+                    <span style="color: rgba(56, 189, 248, 0.7);">┅ 10m Forecast (95% CI)</span>
+                </div>
+            </div>
             <canvas id="chart-canvas" class="chart-canvas"></canvas>
             
             <div class="interlock-box" id="interlock-text">
-                [CONFORMAL TRAJECTORY STABLE: MAP & BIS SAFELY BOUNDED WITH 95% STATISTICAL COVERAGE]
+                [SYNCHRONIZING WITH PHYSIOLOGIC CO-PILOT...]
             </div>
         </div>
 
@@ -407,14 +427,14 @@ HTML_DASHBOARD_TEMPLATE = """
                         <div style="font-weight: 700; color: #38bdf8;">Propofol (Hypnotic)</div>
                         <div style="font-size: 0.8rem; color: var(--text-muted);">Target Ce: 2.2 µg/mL | Synergistic Ridge</div>
                     </div>
-                    <div style="font-size: 1.4rem; font-weight: 800;" id="rate-prop">3.45 <span style="font-size: 0.8rem; font-weight: 400;">mg/kg/h</span></div>
+                    <div style="font-size: 1.4rem; font-weight: 800;" id="rate-prop">0.00 <span style="font-size: 0.8rem; font-weight: 400;">mg/kg/h</span></div>
                 </div>
                 <div class="syringe-item">
                     <div>
                         <div style="font-weight: 700; color: #a78bfa;">Remifentanil (Opioid)</div>
                         <div style="font-size: 0.8rem; color: var(--text-muted);">Target Ce: 1.5 ng/mL | Analgesic Tone</div>
                     </div>
-                    <div style="font-size: 1.4rem; font-weight: 800;" id="rate-remi">0.120 <span style="font-size: 0.8rem; font-weight: 400;">µg/kg/min</span></div>
+                    <div style="font-size: 1.4rem; font-weight: 800;" id="rate-remi">0.000 <span style="font-size: 0.8rem; font-weight: 400;">µg/kg/min</span></div>
                 </div>
                 <div class="syringe-item">
                     <div>
@@ -429,7 +449,7 @@ HTML_DASHBOARD_TEMPLATE = """
                 <h3>Safety, Interlocks & Hardware Status</h3>
                 <div style="font-size: 0.85rem; line-height: 1.6;">
                     <div>• <b>Autonomy:</b> <span id="autonomy-txt" style="color: var(--green);">Level 4 Closed-Loop</span></div>
-                    <div>• <b>HOCBF QP Filter:</b> <span style="color: var(--green);">ACTIVE (Forward Invariance Certified)</span></div>
+                    <div>• <b>HOCBF QP Filter:</b> <span id="hocbf-txt" style="color: var(--green);">ACTIVE (Forward Invariance Certified)</span></div>
                     <div>• <b>Bedside Watchdog:</b> <span id="watchdog-txt" style="color: var(--green);">HEARTBEAT NORMAL (<500ms)</span></div>
                     <div>• <b>Signal Quality:</b> <span id="signal-txt" style="color: var(--green);">SQI 98% | EMG 24 dB (CLEAN)</span></div>
                     <div style="margin-top: 10px; padding: 8px; background-color: #0b1120; border-radius: 4px;" id="preload-txt">
@@ -443,27 +463,106 @@ HTML_DASHBOARD_TEMPLATE = """
     <script>
         let currentSuite = 'OR-1';
         let ws = null;
+        let pollTimer = null;
         let bisHistory = [];
         let mapHistory = [];
+        let latestPredictions = null;
         const canvas = document.getElementById('chart-canvas');
         const ctx = canvas.getContext('2d');
+        const connBadge = document.getElementById('conn-badge');
 
         function resizeCanvas() {
-            canvas.width = canvas.clientWidth;
-            canvas.height = canvas.clientHeight;
+            const rect = canvas.getBoundingClientRect();
+            canvas.width = rect.width > 100 ? rect.width : (canvas.clientWidth || 800);
+            canvas.height = rect.height > 50 ? rect.height : (canvas.clientHeight || 220);
+            drawChart();
         }
         window.addEventListener('resize', resizeCanvas);
-        resizeCanvas();
+        window.addEventListener('DOMContentLoaded', resizeCanvas);
+        setTimeout(resizeCanvas, 100);
+
+        function setConnectionState(state, text) {
+            if (state === 'online') {
+                connBadge.style.color = 'var(--green)';
+                connBadge.innerText = `● ${text || 'CENTRAL CO-PILOT LIVE (2 Hz WS)'}`;
+            } else if (state === 'polling') {
+                connBadge.style.color = 'var(--blue)';
+                connBadge.innerText = `● ${text || 'CENTRAL CO-PILOT LIVE (HTTP POLLING)'}`;
+            } else {
+                connBadge.style.color = 'var(--amber)';
+                connBadge.innerText = `● ${text || 'RECONNECTING TELEMETRY STREAM...'}`;
+            }
+        }
 
         function connectWS(suite) {
-            if (ws) ws.close();
+            if (ws) {
+                try { ws.close(); } catch(e) {}
+                ws = null;
+            }
+            if (pollTimer) {
+                clearInterval(pollTimer);
+                pollTimer = null;
+            }
+
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            ws = new WebSocket(`${protocol}//${window.location.host}/ws/telemetry/${suite}`);
-            
-            ws.onmessage = (event) => {
-                const data = JSON.parse(event.data);
-                updateUI(data);
+            const host = window.location.host || '127.0.0.1:8000';
+            const wsUrl = `${protocol}//${host}/ws/telemetry/${suite}`;
+
+            try {
+                ws = new WebSocket(wsUrl);
+                setConnectionState('connecting', 'CONNECTING TO TELEMETRY STREAM...');
+
+                ws.onopen = () => {
+                    setConnectionState('online', 'CENTRAL CO-PILOT LIVE (2 Hz WS)');
+                    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+                };
+
+                ws.onmessage = (event) => {
+                    try {
+                        const data = JSON.parse(event.data);
+                        updateUI(data);
+                    } catch(err) {
+                        console.error('Parse error:', err);
+                    }
+                };
+
+                ws.onerror = (e) => {
+                    console.warn('WebSocket error, switching to HTTP fallback polling:', e);
+                    setConnectionState('polling', 'CENTRAL CO-PILOT LIVE (HTTP FALLBACK)');
+                    startPollingFallback(suite);
+                };
+
+                ws.onclose = () => {
+                    console.warn('WebSocket closed, switching to HTTP fallback polling...');
+                    setConnectionState('polling', 'CENTRAL CO-PILOT LIVE (HTTP FALLBACK)');
+                    startPollingFallback(suite);
+                    // Attempt WS reconnect after 3 seconds
+                    setTimeout(() => {
+                        if (currentSuite === suite) connectWS(suite);
+                    }, 3000);
+                };
+            } catch(e) {
+                console.warn('Failed to initialize WebSocket, starting HTTP polling:', e);
+                startPollingFallback(suite);
+            }
+        }
+
+        function startPollingFallback(suite) {
+            if (pollTimer) return;
+            const fetchTelemetry = async () => {
+                try {
+                    const res = await fetch(`/api/telemetry/${suite}`);
+                    if (res.ok) {
+                        const data = await res.json();
+                        updateUI(data);
+                        setConnectionState('polling', 'CENTRAL CO-PILOT LIVE (HTTP POLLING)');
+                    }
+                } catch(err) {
+                    setConnectionState('error', 'DISCONNECTED - RETRYING SERVER...');
+                }
             };
+            fetchTelemetry();
+            pollTimer = setInterval(fetchTelemetry, 1000);
         }
 
         function switchSuite(suite) {
@@ -474,10 +573,13 @@ HTML_DASHBOARD_TEMPLATE = """
             document.getElementById('suite-header').innerText = `Active Suite: ${suite}`;
             bisHistory = [];
             mapHistory = [];
+            drawChart();
             connectWS(suite);
         }
 
         function updateUI(data) {
+            if (!data || !data.vitals) return;
+
             document.getElementById('val-bis').innerText = data.vitals.filtered_bis.toFixed(1);
             document.getElementById('val-map').innerText = data.vitals.filtered_map.toFixed(1);
             document.getElementById('val-hr').innerText = data.vitals.filtered_hr.toFixed(1);
@@ -490,41 +592,166 @@ HTML_DASHBOARD_TEMPLATE = """
 
             document.getElementById('interlock-text').innerText = data.predictions.interlock_message;
             document.getElementById('preload-txt').innerText = data.safety.preload_advisory;
+            document.getElementById('autonomy-txt').innerText = data.autonomy_level === 'LEVEL_4_CLOSED_LOOP' ? 'Level 4 Closed-Loop' : 'Level 2 Advisory';
+            document.getElementById('signal-txt').innerText = `SQI ${data.vitals.sqi_percent.toFixed(0)}% | EMG ${data.vitals.emg_db.toFixed(0)} dB (CLEAN)`;
 
-            // Update buffers
+            latestPredictions = data.predictions;
+
+            // Update buffers (up to 70 points for historical curve)
             bisHistory.push(data.vitals.filtered_bis);
             mapHistory.push(data.vitals.filtered_map);
-            if (bisHistory.length > 80) { bisHistory.shift(); mapHistory.shift(); }
+            if (bisHistory.length > 70) { 
+                bisHistory.shift(); 
+                mapHistory.shift(); 
+            }
 
             drawChart();
         }
 
         function drawChart() {
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
             const w = canvas.width;
             const h = canvas.height;
+            if (!w || !h) return;
 
-            // Draw target BIS zone (40 - 60)
+            ctx.clearRect(0, 0, w, h);
+
+            // 1. Target BIS Therapeutic Zone (40 - 60)
             const y60 = h - (60 / 120) * h;
             const y40 = h - (40 / 120) * h;
-            ctx.fillStyle = 'rgba(16, 185, 129, 0.08)';
+            ctx.fillStyle = 'rgba(16, 185, 129, 0.12)';
             ctx.fillRect(0, y60, w, y40 - y60);
 
-            // Draw line
-            if (bisHistory.length < 2) return;
-            ctx.strokeStyle = '#38bdf8';
-            ctx.lineWidth = 2.5;
+            // Dotted boundaries for target zone
+            ctx.strokeStyle = 'rgba(16, 185, 129, 0.4)';
+            ctx.setLineDash([4, 4]);
+            ctx.lineWidth = 1;
             ctx.beginPath();
-            const stepX = w / 80;
+            ctx.moveTo(0, y60); ctx.lineTo(w, y60);
+            ctx.moveTo(0, y40); ctx.lineTo(w, y40);
+            ctx.stroke();
+            ctx.setLineDash([]);
+
+            // Target zone label
+            ctx.font = '10px sans-serif';
+            ctx.fillStyle = 'rgba(16, 185, 129, 0.7)';
+            ctx.fillText('TARGET BIS: 40 - 60 (Adequate Surgical Anesthesia)', 12, y60 + 14);
+
+            // 2. Horizontal Grid Lines & Y-Axis Labels
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.06)';
+            ctx.lineWidth = 1;
+            [20, 40, 60, 80, 100].forEach(level => {
+                const y = h - (level / 120) * h;
+                ctx.beginPath();
+                ctx.moveTo(0, y);
+                ctx.lineTo(w, y);
+                ctx.stroke();
+
+                ctx.fillStyle = 'rgba(156, 163, 175, 0.5)';
+                ctx.font = '9px sans-serif';
+                ctx.fillText(`${level}`, 4, y - 3);
+            });
+
+            // If no data points yet, draw clean placeholder
+            if (bisHistory.length < 2) {
+                ctx.font = '12px sans-serif';
+                ctx.fillStyle = 'rgba(156, 163, 175, 0.6)';
+                ctx.textAlign = 'center';
+                ctx.fillText('INITIALIZING CONTINUOUS PHYSIOLOGICAL STREAM (2 Hz)...', w / 2, h / 2);
+                ctx.textAlign = 'left';
+                return;
+            }
+
+            // Reserve left 75% for history, right 25% for conformal forecast projection
+            const historyW = w * 0.75;
+            const futureW = w * 0.25;
+            const stepX = historyW / Math.max(bisHistory.length - 1, 1);
+
+            // 3. Draw MAP Trajectory (Neon Coral / Rose)
+            ctx.strokeStyle = '#f43f5e';
+            ctx.lineWidth = 1.8;
+            ctx.beginPath();
+            for (let i = 0; i < mapHistory.length; i++) {
+                const x = i * stepX;
+                // Scale MAP (0 to 140 mmHg) to canvas height
+                const y = h - (mapHistory[i] / 140) * h;
+                if (i === 0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+            }
+            ctx.stroke();
+
+            // 4. Draw BIS Trajectory (Cyan Glow)
+            ctx.shadowColor = '#38bdf8';
+            ctx.shadowBlur = 6;
+            ctx.strokeStyle = '#38bdf8';
+            ctx.lineWidth = 2.4;
+            ctx.beginPath();
+            let lastX = 0;
+            let lastY = 0;
             for (let i = 0; i < bisHistory.length; i++) {
                 const x = i * stepX;
                 const y = h - (bisHistory[i] / 120) * h;
                 if (i === 0) ctx.moveTo(x, y);
                 else ctx.lineTo(x, y);
+                lastX = x;
+                lastY = y;
             }
             ctx.stroke();
+            ctx.shadowBlur = 0;
+
+            // Draw current pulsating head dot
+            ctx.fillStyle = '#38bdf8';
+            ctx.beginPath();
+            ctx.arc(lastX, lastY, 4, 0, Math.PI * 2);
+            ctx.fill();
+
+            // 5. Draw 10-Min Conformal Risk Predictive Cone (Future Projection)
+            if (latestPredictions && latestPredictions.bis_10min_conformal_low !== undefined) {
+                const low = latestPredictions.bis_10min_conformal_low;
+                const high = latestPredictions.bis_10min_conformal_high;
+                const endX = w - 10;
+                const yLow = h - (low / 120) * h;
+                const yHigh = h - (high / 120) * h;
+
+                // Shaded forecast cone
+                ctx.fillStyle = 'rgba(56, 189, 248, 0.15)';
+                ctx.beginPath();
+                ctx.moveTo(lastX, lastY);
+                ctx.lineTo(endX, yHigh);
+                ctx.lineTo(endX, yLow);
+                ctx.closePath();
+                ctx.fill();
+
+                // Dashed forecast boundary lines
+                ctx.strokeStyle = 'rgba(56, 189, 248, 0.6)';
+                ctx.setLineDash([4, 3]);
+                ctx.lineWidth = 1.2;
+                ctx.beginPath();
+                ctx.moveTo(lastX, lastY); ctx.lineTo(endX, yHigh);
+                ctx.moveTo(lastX, lastY); ctx.lineTo(endX, yLow);
+                ctx.stroke();
+                ctx.setLineDash([]);
+
+                // Label at cone apex
+                ctx.font = '9px sans-serif';
+                ctx.fillStyle = '#38bdf8';
+                ctx.fillText(`+10m CI [${low.toFixed(0)}-${high.toFixed(0)}]`, endX - 60, (yLow + yHigh) / 2);
+            }
+
+            // Timeline divider (NOW)
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
+            ctx.setLineDash([2, 2]);
+            ctx.beginPath();
+            ctx.moveTo(lastX, 0);
+            ctx.lineTo(lastX, h);
+            ctx.stroke();
+            ctx.setLineDash([]);
+
+            ctx.font = '9px sans-serif';
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.5)';
+            ctx.fillText('NOW', lastX - 12, h - 8);
         }
 
+        // Initialize immediately
         connectWS('OR-1');
     </script>
 </body>
