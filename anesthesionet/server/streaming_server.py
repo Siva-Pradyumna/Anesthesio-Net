@@ -246,19 +246,44 @@ def create_app() -> FastAPI:
         elif action == "artifact":
             suite.injected_artifact_duration = float(payload.get("duration", 6.0))
         elif action == "stage":
-            new_stage = payload.get("stage")
-            for st in SurgicalStage:
-                if st.value == new_stage or st.name == new_stage:
-                    suite.controller.stage = st
-                    if st == SurgicalStage.STAGE_0_STANDBY:
-                        suite.engine.simulator.pk_prop.state[:] = 0.0
-                        suite.engine.simulator.pk_remi.state[:] = 0.0
-                        suite.engine.simulator.hemodynamics.baseline_map = 90.0
-                        suite.latest_action = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-                    elif st == SurgicalStage.STAGE_2_MAINTENANCE:
-                        suite.engine.simulator.pk_prop.state[3] = 2.2
-                        suite.engine.simulator.pk_remi.state[3] = 1.5
-                    break
+            new_stage = str(payload.get("stage", ""))
+            if "STANDBY" in new_stage.upper() or new_stage == "0":
+                suite.controller.stage = SurgicalStage.STANDBY
+                suite.controller.induction_controller.reset()
+                suite.engine.simulator.pk_prop.reset()
+                suite.engine.simulator.pk_remi.reset()
+                suite.engine.simulator.hemodynamics.baseline_map = 90.0
+                suite.latest_action = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+
+            elif "INDUCTION" in new_stage.upper() or new_stage == "1":
+                suite.controller.stage = SurgicalStage.STAGE_1_INDUCTION
+                bolus_mg = suite.controller.trigger_induction()
+                suite.engine.simulator.pk_prop.bolus(bolus_mg)
+                prop_rate, remi_rate, norepi_rate, _ = suite.controller.induction_controller.compute_infusion_rates(
+                    type("VitalsObj", (), {
+                        "bis": 98.0,
+                        "map_mmhg": suite.engine.simulator.hemodynamics.baseline_map,
+                        "hr_bpm": 75.0,
+                        "ce_propofol_ug_ml": suite.engine.simulator.pk_prop.Ce,
+                        "ce_remi_ng_ml": suite.engine.simulator.pk_remi.Ce,
+                        "time_seconds": suite.current_time_sec
+                    })()
+                )
+                suite.latest_action = np.array([prop_rate, remi_rate, norepi_rate], dtype=np.float32)
+
+            elif "MAINTENANCE" in new_stage.upper() or "MAINT" in new_stage.upper() or new_stage == "2":
+                suite.controller.stage = SurgicalStage.STAGE_2_MAINTENANCE
+                if suite.engine.simulator.pk_prop.Ce < 1.0:
+                    suite.engine.simulator.pk_prop.state[3] = 2.2
+                    suite.engine.simulator.pk_prop.state[0] = 16.0
+                if suite.engine.simulator.pk_remi.Ce < 0.5:
+                    suite.engine.simulator.pk_remi.state[3] = 1.5
+                    suite.engine.simulator.pk_remi.state[0] = 7.0
+                suite.latest_action = np.array([3.5, 0.12, 0.0], dtype=np.float32)
+
+            elif "EMERGENCE" in new_stage.upper() or new_stage == "3":
+                suite.controller.trigger_emergence(suite.current_time_sec)
+                suite.latest_action = np.array([0.0, 0.0, 0.0], dtype=np.float32)
         elif action == "mode":
             new_mode = payload.get("mode")
             if new_mode == "MODE_B_REPLAY":
@@ -1051,7 +1076,11 @@ HTML_DASHBOARD_TEMPLATE = """
             // Update Stage Pill Active State
             if (data.stage) {
                 document.querySelectorAll('.stage-pill').forEach(el => el.classList.remove('active'));
-                const activePill = document.getElementById(`pill-${data.stage}`);
+                let pillId = `pill-${data.stage}`;
+                if (data.stage === 'STANDBY') pillId = 'pill-STAGE_0_STANDBY';
+                else if (data.stage === 'READINESS_HYSTERESIS') pillId = 'pill-STAGE_1_INDUCTION';
+                else if (data.stage === 'PACU_TRANSFER') pillId = 'pill-STAGE_3_EMERGENCE';
+                const activePill = document.getElementById(pillId);
                 if (activePill) activePill.classList.add('active');
             }
 
@@ -1138,8 +1167,8 @@ HTML_DASHBOARD_TEMPLATE = """
             ctx.beginPath();
             for (let i = 0; i < mapHistory.length; i++) {
                 const x = i * stepX;
-                // Scale MAP (0 to 140 mmHg) to canvas height
-                const y = h - (mapHistory[i] / 140) * h;
+                // Scale MAP (unified 0 to 120 mmHg scale) to canvas height
+                const y = h - (mapHistory[i] / 120) * h;
                 if (i === 0) ctx.moveTo(x, y);
                 else ctx.lineTo(x, y);
             }

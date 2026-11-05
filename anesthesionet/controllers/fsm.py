@@ -83,14 +83,18 @@ class FullLifecycleController:
             )
             raw_action = np.array([prop, remi, norepi], dtype=np.float32)
 
-            if self.induction_controller.state == "HYSTERESIS_DWELL":
+            if self.induction_controller.state == "TCI_RAMPING":
+                info["badge"] = "[STAGE 1: TCI INDUCTION RAMPING]"
+            elif self.induction_controller.state == "LOC_CONFIRMED":
+                info["badge"] = "[LOC CONFIRMED — VERIFYING STABILITY]"
+            elif self.induction_controller.state == "HYSTERESIS_DWELL":
                 self.stage = SurgicalStage.READINESS_HYSTERESIS
                 info["badge"] = f"[HYSTERESIS LOCK: {self.induction_controller.consecutive_dwell_sec:.0f}s / 30s]"
 
             if is_cleared:
                 # Transition to Stage 2 Maintenance
                 self.stage = SurgicalStage.STAGE_2_MAINTENANCE
-                info["badge"] = "[INDUCTION COMPLETE — SAFE FOR SURGICAL INCISION]"
+                info["badge"] = "[SAFE FOR SURGICAL INCISION — TRANSITION TO MAINTENANCE]"
 
             # Run safety filter
             safe_action, was_safety_intervened, _ = self.safety_filter.filter_action(
