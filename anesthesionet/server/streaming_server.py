@@ -303,52 +303,65 @@ HTML_DASHBOARD_TEMPLATE = """
             --text-light: #f3f4f6;
             --text-muted: #9ca3af;
         }
-        body {
+        * {
+            box-sizing: border-box;
+        }
+        html, body {
             margin: 0;
             padding: 0;
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+            width: 100vw;
+            height: 100vh;
+            max-height: 100vh;
+            overflow: hidden;
             background-color: var(--bg-dark);
             color: var(--text-light);
-            overflow-x: hidden;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
         }
         header {
+            height: 42px;
+            min-height: 42px;
+            max-height: 42px;
             background-color: var(--card-bg);
             border-bottom: 1px solid var(--border);
-            padding: 12px 24px;
+            padding: 0 16px;
             display: flex;
             justify-content: space-between;
             align-items: center;
+            flex-shrink: 0;
         }
         .header-title {
-            font-size: 1.3rem;
+            font-size: 1.15rem;
             font-weight: 700;
             color: #fff;
             display: flex;
             align-items: center;
-            gap: 10px;
+            gap: 8px;
         }
         .header-badge {
             background-color: #064e3b;
             color: var(--green);
-            padding: 4px 8px;
+            padding: 3px 6px;
             border-radius: 4px;
-            font-size: 0.75rem;
+            font-size: 0.7rem;
             font-weight: 600;
-            letter-spacing: 0.05em;
+            letter-spacing: 0.04em;
         }
         .nav-tabs {
             display: flex;
-            gap: 8px;
+            gap: 6px;
             background-color: #0f172a;
-            padding: 4px;
-            border-radius: 8px;
+            padding: 3px;
+            border-radius: 6px;
         }
         .tab-btn {
             background: none;
             border: none;
             color: var(--text-muted);
-            padding: 6px 16px;
-            border-radius: 6px;
+            padding: 4px 12px;
+            border-radius: 5px;
+            font-size: 0.78rem;
             font-weight: 600;
             cursor: pointer;
             transition: all 0.2s;
@@ -358,55 +371,59 @@ HTML_DASHBOARD_TEMPLATE = """
             color: #fff;
         }
         main {
-            padding: 20px;
-            max-width: 1440px;
-            margin: 0 auto;
-        }
-        .triage-grid {
+            flex: 1;
             display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 16px;
-            margin-bottom: 20px;
+            grid-template-columns: 1.45fr 1fr;
+            gap: 10px;
+            padding: 8px 12px;
+            overflow: hidden;
+            height: calc(100vh - 42px);
+            max-height: calc(100vh - 42px);
         }
-        .triage-card {
+        .col-left {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            height: 100%;
+            min-height: 0;
+            overflow: hidden;
+        }
+        .telemetry-card {
             background-color: var(--card-bg);
             border: 1px solid var(--border);
             border-radius: 8px;
-            padding: 14px;
-            cursor: pointer;
-        }
-        .triage-card.active-suite {
-            border-color: var(--blue);
-            box-shadow: 0 0 12px rgba(59, 130, 246, 0.3);
-        }
-        .main-grid {
-            display: grid;
-            grid-template-columns: 2fr 1fr;
-            gap: 20px;
-        }
-        .panel {
-            background-color: var(--card-bg);
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            padding: 16px;
-            margin-bottom: 20px;
+            padding: 10px 12px;
+            display: flex;
+            flex-direction: column;
+            flex: 1;
+            min-height: 0;
         }
         .vitals-banner {
             display: grid;
             grid-template-columns: repeat(4, 1fr);
-            gap: 12px;
-            margin-bottom: 16px;
+            gap: 8px;
+            margin: 6px 0;
         }
         .vital-box {
             background-color: #1e293b;
             border-radius: 6px;
-            padding: 12px;
+            padding: 6px;
             text-align: center;
         }
+        .vital-title {
+            font-size: 0.68rem;
+            color: var(--text-muted);
+            font-weight: 600;
+            letter-spacing: 0.03em;
+        }
         .vital-num {
-            font-size: 2.2rem;
+            font-size: 1.6rem;
             font-weight: 800;
-            margin: 4px 0;
+            line-height: 1.1;
+            margin: 2px 0;
+        }
+        .vital-sub {
+            font-size: 0.65rem;
         }
         .bis-color { color: #38bdf8; }
         .map-color { color: #f43f5e; }
@@ -414,40 +431,122 @@ HTML_DASHBOARD_TEMPLATE = """
         .ppv-color { color: #fbbf24; }
         .chart-canvas {
             width: 100%;
-            height: 220px;
+            flex: 1;
+            min-height: 120px;
             background-color: #0b1120;
             border-radius: 6px;
-        }
-        .syringe-item {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 10px;
-            background-color: #1e293b;
-            border-radius: 6px;
-            margin-bottom: 8px;
+            display: block;
         }
         .interlock-box {
             background-color: #172554;
-            border-left: 4px solid var(--blue);
-            padding: 12px;
+            border-left: 3px solid var(--blue);
+            padding: 5px 8px;
             border-radius: 4px;
-            font-size: 0.9rem;
-            margin-top: 12px;
+            font-size: 0.76rem;
+            font-weight: 600;
+            color: #bfdbfe;
+            margin-top: 6px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .syringe-card {
+            background-color: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 8px 12px;
+            flex-shrink: 0;
+        }
+        .syringe-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 8px;
+        }
+        .syringe-item {
+            background-color: #1e293b;
+            border-radius: 6px;
+            padding: 6px 8px;
+            border: 1px solid #334155;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+        }
+        .syringe-drug {
+            font-size: 0.75rem;
+            font-weight: 700;
+        }
+        .syringe-sub {
+            font-size: 0.65rem;
+            color: var(--text-muted);
+        }
+        .syringe-rate {
+            font-size: 1.25rem;
+            font-weight: 800;
+            line-height: 1.1;
+            margin-top: 2px;
+        }
+        .col-right {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            height: 100%;
+            min-height: 0;
+            overflow: hidden;
+        }
+        .panel-card {
+            background-color: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 8px 12px;
+        }
+        .safety-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 4px 10px;
+            font-size: 0.75rem;
+            line-height: 1.35;
+        }
+        .safety-grid b {
+            color: #9ca3af;
+        }
+        .preload-strip {
+            margin-top: 6px;
+            padding: 4px 8px;
+            background-color: #0b1120;
+            border-radius: 4px;
+            font-size: 0.72rem;
+            font-weight: 600;
+            color: #fbbf24;
+            border-left: 3px solid #f59e0b;
+        }
+        .section-label {
+            font-size: 0.7rem;
+            font-weight: 700;
+            color: var(--text-muted);
+            margin: 0 0 5px 0;
+            letter-spacing: 0.03em;
+        }
+        .stress-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 5px;
+            margin-bottom: 6px;
         }
         .ctrl-btn {
             background: #1e293b;
             color: #f3f4f6;
             border: 1px solid #334155;
-            padding: 8px 12px;
-            border-radius: 6px;
-            font-size: 0.8rem;
+            padding: 5px 6px;
+            border-radius: 5px;
+            font-size: 0.7rem;
             font-weight: 600;
             cursor: pointer;
             transition: all 0.15s ease;
-            display: inline-flex;
+            display: flex;
             align-items: center;
-            gap: 6px;
+            gap: 4px;
+            justify-content: center;
+            white-space: nowrap;
         }
         .ctrl-btn:hover {
             background: #334155;
@@ -461,16 +560,24 @@ HTML_DASHBOARD_TEMPLATE = """
         .ctrl-btn-bolus:hover { background: #047857; }
         .ctrl-btn-bovie { background: #78350f; border-color: #d97706; color: #fef3c7; }
         .ctrl-btn-bovie:hover { background: #92400e; }
+        .stage-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 4px;
+            margin-bottom: 6px;
+        }
         .stage-pill {
-            padding: 6px 12px;
-            border-radius: 6px;
-            font-size: 0.78rem;
+            padding: 4px 4px;
+            border-radius: 5px;
+            font-size: 0.68rem;
             font-weight: 700;
             cursor: pointer;
             border: 1px solid #334155;
             background: #0f172a;
             color: var(--text-muted);
-            transition: all 0.2s ease;
+            text-align: center;
+            transition: all 0.15s ease;
+            white-space: nowrap;
         }
         .stage-pill:hover { border-color: var(--blue); color: #fff; }
         .stage-pill.active {
@@ -478,23 +585,30 @@ HTML_DASHBOARD_TEMPLATE = """
             border-color: #3b82f6;
             color: #93c5fd;
         }
+        .toggles-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-top: 1px solid var(--border);
+            padding-top: 5px;
+        }
         .xai-bar-wrap {
             display: flex;
             align-items: center;
-            gap: 10px;
-            margin-bottom: 8px;
-            font-size: 0.8rem;
+            gap: 6px;
+            margin-bottom: 4px;
+            font-size: 0.72rem;
         }
         .xai-bar-track {
             flex: 1;
-            height: 7px;
+            height: 6px;
             background: #0b1120;
-            border-radius: 4px;
+            border-radius: 3px;
             overflow: hidden;
         }
         .xai-bar-fill {
             height: 100%;
-            border-radius: 4px;
+            border-radius: 3px;
             transition: width 0.3s ease;
         }
     </style>
@@ -510,146 +624,158 @@ HTML_DASHBOARD_TEMPLATE = """
             <button class="tab-btn" onclick="switchSuite('OR-2')">SUITE 2 (OR-2)</button>
             <button class="tab-btn" onclick="switchSuite('OR-3')">SUITE 3 (OR-3)</button>
         </div>
-        <div id="conn-badge" style="font-size: 0.85rem; color: var(--amber); font-weight: 600;">
+        <div id="conn-badge" style="font-size: 0.78rem; color: var(--amber); font-weight: 600;">
             ● INITIALIZING TELEMETRY STREAM...
         </div>
     </header>
 
     <main>
-        <div class="panel">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-                <h3 style="margin: 0;" id="suite-header">Active Suite: OR-1 (Laparoscopic Cholecystectomy)</h3>
-                <span id="stage-badge" class="header-badge" style="background-color: #1e3a8a; color: #93c5fd;">[STAGE 2: MAINTENANCE]</span>
+        <!-- LEFT COLUMN: Live Telemetry, Waveforms & Syringe Infusion Rack -->
+        <div class="col-left">
+            <div class="telemetry-card">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                    <h3 style="margin: 0; font-size: 0.95rem;" id="suite-header">Active Suite: OR-1 (Laparoscopic Cholecystectomy)</h3>
+                    <span id="stage-badge" class="header-badge" style="background-color: #1e3a8a; color: #93c5fd;">[STAGE 2: MAINTENANCE]</span>
+                </div>
+
+                <div class="vitals-banner">
+                    <div class="vital-box">
+                        <div class="vital-title">BISPECTRAL INDEX</div>
+                        <div class="vital-num bis-color" id="val-bis">--</div>
+                        <div class="vital-sub" style="color: var(--green);">Target: 40 - 60</div>
+                    </div>
+                    <div class="vital-box">
+                        <div class="vital-title">MEAN ARTERIAL PRESSURE</div>
+                        <div class="vital-num map-color" id="val-map">--</div>
+                        <div class="vital-sub" style="color: var(--green);">Target: 65 - 100 mmHg</div>
+                    </div>
+                    <div class="vital-box">
+                        <div class="vital-title">HEART RATE</div>
+                        <div class="vital-num hr-color" id="val-hr">--</div>
+                        <div class="vital-sub" style="color: var(--text-muted);">bpm (Sinus)</div>
+                    </div>
+                    <div class="vital-box">
+                        <div class="vital-title">PULSE PRESSURE VAR (PPV)</div>
+                        <div class="vital-num ppv-color" id="val-ppv">--</div>
+                        <div class="vital-sub" style="color: var(--green);">Normovolemic (&lt;13%)</div>
+                    </div>
+                </div>
+
+                <div style="display: flex; justify-content: space-between; align-items: center; margin: 2px 0 4px 0;">
+                    <div style="font-size: 0.78rem; font-weight: 600;">Live Waveform &amp; Conformal Predictive Risk Bands (10-Min Horizon)</div>
+                    <div style="font-size: 0.7rem; color: var(--text-muted); display: flex; gap: 8px;">
+                        <span style="color: #38bdf8;">— BIS</span>
+                        <span style="color: #f43f5e;">— MAP</span>
+                        <span style="color: #10b981;">░ Target</span>
+                        <span style="color: rgba(56, 189, 248, 0.7);">┅ 10m Cone</span>
+                    </div>
+                </div>
+                <canvas id="chart-canvas" class="chart-canvas"></canvas>
+
+                <div class="interlock-box" id="interlock-text">
+                    [SYNCHRONIZING WITH PHYSIOLOGIC CO-PILOT...]
+                </div>
             </div>
 
-            <div class="vitals-banner">
-                <div class="vital-box">
-                    <div style="font-size: 0.8rem; color: var(--text-muted);">BISPECTRAL INDEX</div>
-                    <div class="vital-num bis-color" id="val-bis">--</div>
-                    <div style="font-size: 0.75rem; color: var(--green);">Target: 40 - 60</div>
+            <!-- Syringe Pump Infusion Array (Compact 3-Rack) -->
+            <div class="syringe-card">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                    <div style="font-size: 0.8rem; font-weight: 700;">Automated Syringe Pump Infusion Array</div>
+                    <div style="font-size: 0.68rem; color: var(--text-muted);">MIMO-SAC Closed-Loop Infusion</div>
                 </div>
-                <div class="vital-box">
-                    <div style="font-size: 0.8rem; color: var(--text-muted);">MEAN ARTERIAL PRESSURE</div>
-                    <div class="vital-num map-color" id="val-map">--</div>
-                    <div style="font-size: 0.75rem; color: var(--green);">Target: 65 - 100 mmHg</div>
+                <div class="syringe-grid">
+                    <div class="syringe-item">
+                        <div>
+                            <div class="syringe-drug" style="color: #38bdf8;">Propofol (Hypnotic)</div>
+                            <div class="syringe-sub">Ce: 2.2 µg/mL | Ridge</div>
+                        </div>
+                        <div class="syringe-rate" id="rate-prop">0.00 <span style="font-size: 0.7rem; font-weight: 400;">mg/kg/h</span></div>
+                    </div>
+                    <div class="syringe-item">
+                        <div>
+                            <div class="syringe-drug" style="color: #a78bfa;">Remifentanil (Opioid)</div>
+                            <div class="syringe-sub">Ce: 1.5 ng/mL | Analgesic</div>
+                        </div>
+                        <div class="syringe-rate" id="rate-remi">0.000 <span style="font-size: 0.7rem; font-weight: 400;">µg/kg/min</span></div>
+                    </div>
+                    <div class="syringe-item">
+                        <div>
+                            <div class="syringe-drug" style="color: #f43f5e;">Norepinephrine (Pressor)</div>
+                            <div class="syringe-sub">Preload Guarded | SVR</div>
+                        </div>
+                        <div class="syringe-rate" id="rate-norepi">0.000 <span style="font-size: 0.7rem; font-weight: 400;">µg/kg/min</span></div>
+                    </div>
                 </div>
-                <div class="vital-box">
-                    <div style="font-size: 0.8rem; color: var(--text-muted);">HEART RATE</div>
-                    <div class="vital-num hr-color" id="val-hr">--</div>
-                    <div style="font-size: 0.75rem; color: var(--text-muted);">bpm (Sinus)</div>
-                </div>
-                <div class="vital-box">
-                    <div style="font-size: 0.8rem; color: var(--text-muted);">PULSE PRESSURE VAR (PPV)</div>
-                    <div class="vital-num ppv-color" id="val-ppv">--</div>
-                    <div style="font-size: 0.75rem; color: var(--green);">Normovolemic (<13%)</div>
-                </div>
-            </div>
-
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
-                <div style="font-size: 0.9rem; font-weight: 600;">Live Waveform & Conformal Predictive Risk Bands (10-Min Horizon)</div>
-                <div style="font-size: 0.75rem; color: var(--text-muted); display: flex; gap: 14px;">
-                    <span style="color: #38bdf8;">— BIS (Depth)</span>
-                    <span style="color: #f43f5e;">— MAP (Hemodynamics)</span>
-                    <span style="color: #10b981;">░ Target (40-60)</span>
-                    <span style="color: rgba(56, 189, 248, 0.7);">┅ 10m Forecast (95% CI)</span>
-                </div>
-            </div>
-            <canvas id="chart-canvas" class="chart-canvas"></canvas>
-            
-            <div class="interlock-box" id="interlock-text">
-                [SYNCHRONIZING WITH PHYSIOLOGIC CO-PILOT...]
             </div>
         </div>
 
-        <div class="main-grid">
-            <div class="panel">
-                <h3>Automated Syringe Pump Infusion Array</h3>
-                <div class="syringe-item">
-                    <div>
-                        <div style="font-weight: 700; color: #38bdf8;">Propofol (Hypnotic)</div>
-                        <div style="font-size: 0.8rem; color: var(--text-muted);">Target Ce: 2.2 µg/mL | Synergistic Ridge</div>
-                    </div>
-                    <div style="font-size: 1.4rem; font-weight: 800;" id="rate-prop">0.00 <span style="font-size: 0.8rem; font-weight: 400;">mg/kg/h</span></div>
+        <!-- RIGHT COLUMN: Safety Guardrails, Interactive Challenges & Explainable AI -->
+        <div class="col-right">
+            <!-- Panel 1: Safety & Hardware Status -->
+            <div class="panel-card" style="flex-shrink: 0;">
+                <div style="font-size: 0.8rem; font-weight: 700; margin-bottom: 6px; display: flex; justify-content: space-between;">
+                    <span>Safety, Interlocks &amp; Hardware Status</span>
+                    <span style="font-size: 0.68rem; color: var(--green);">DETERMINISTIC GUARDRAILS</span>
                 </div>
-                <div class="syringe-item">
-                    <div>
-                        <div style="font-weight: 700; color: #a78bfa;">Remifentanil (Opioid)</div>
-                        <div style="font-size: 0.8rem; color: var(--text-muted);">Target Ce: 1.5 ng/mL | Analgesic Tone</div>
-                    </div>
-                    <div style="font-size: 1.4rem; font-weight: 800;" id="rate-remi">0.000 <span style="font-size: 0.8rem; font-weight: 400;">µg/kg/min</span></div>
-                </div>
-                <div class="syringe-item">
-                    <div>
-                        <div style="font-weight: 700; color: #f43f5e;">Norepinephrine (Vasopressor)</div>
-                        <div style="font-size: 0.8rem; color: var(--text-muted);">Preload Guarded | SVR Elevation</div>
-                    </div>
-                    <div style="font-size: 1.4rem; font-weight: 800;" id="rate-norepi">0.000 <span style="font-size: 0.8rem; font-weight: 400;">µg/kg/min</span></div>
-                </div>
-            </div>
-
-            <div class="panel">
-                <h3>Safety, Interlocks & Hardware Status</h3>
-                <div style="font-size: 0.85rem; line-height: 1.6;">
+                <div class="safety-grid">
                     <div>• <b>Autonomy:</b> <span id="autonomy-txt" style="color: var(--green);">Level 4 Closed-Loop</span></div>
-                    <div>• <b>HOCBF QP Filter:</b> <span id="hocbf-txt" style="color: var(--green);">ACTIVE (Forward Invariance Certified)</span></div>
-                    <div>• <b>Bedside Watchdog:</b> <span id="watchdog-txt" style="color: var(--green);">HEARTBEAT NORMAL (<500ms)</span></div>
-                    <div>• <b>Signal Quality:</b> <span id="signal-txt" style="color: var(--green);">SQI 98% | EMG 24 dB (CLEAN)</span></div>
-                    <div style="margin-top: 10px; padding: 8px; background-color: #0b1120; border-radius: 4px;" id="preload-txt">
-                        Preload Gate: Normovolemic (PPV < 13%)
-                    </div>
+                    <div>• <b>HOCBF QP:</b> <span id="hocbf-txt" style="color: var(--green);">ACTIVE (Forward Invariance)</span></div>
+                    <div>• <b>Watchdog:</b> <span id="watchdog-txt" style="color: var(--green);">HEARTBEAT NORMAL (&lt;500ms)</span></div>
+                    <div>• <b>Signal SQI:</b> <span id="signal-txt" style="color: var(--green);">SQI 98% | EMG 24 dB</span></div>
+                </div>
+                <div class="preload-strip" id="preload-txt">
+                    Preload Gate: Normovolemic (PPV &lt; 13%)
                 </div>
             </div>
-        </div>
 
-        <div class="main-grid" style="margin-top: -4px;">
-            <!-- Interactive Clinical Challenge & Lifecycle Console -->
-            <div class="panel">
-                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-                    <h3 style="margin: 0;">Interactive Clinical Challenge & Stress Console</h3>
-                    <span style="font-size: 0.75rem; color: var(--text-muted);">Real-Time Co-Pilot Response Testing</span>
+            <!-- Panel 2: Interactive Clinical Challenge & Lifecycle Console -->
+            <div class="panel-card" style="flex-shrink: 0;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                    <span style="font-size: 0.8rem; font-weight: 700;">Interactive Challenge &amp; Stress Console</span>
+                    <span style="font-size: 0.68rem; color: var(--text-muted);">Real-Time Co-Pilot Response</span>
                 </div>
 
-                <div style="font-size: 0.8rem; font-weight: 700; color: var(--text-muted); margin-bottom: 6px;">PHYSIOLOGICAL STRESS INJECTION:</div>
-                <div style="display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px;">
+                <div class="section-label">PHYSIOLOGICAL STRESS INJECTION:</div>
+                <div class="stress-grid">
                     <button class="ctrl-btn ctrl-btn-pain" onclick="sendAction('pain', {value: 0.85})">
-                        ⚡ Inject Incision Pain (+0.85 Stimulus)
+                        ⚡ Incision Pain (+0.85)
                     </button>
                     <button class="ctrl-btn ctrl-btn-crash" onclick="sendAction('hypotension', {value: 20.0})">
-                        📉 Trigger MAP Crash (-20 mmHg)
+                        📉 MAP Crash (-20 mmHg)
                     </button>
                     <button class="ctrl-btn ctrl-btn-bolus" onclick="sendAction('bolus', {})">
-                        💧 Infuse 250mL Fluid Bolus
+                        💧 250mL Fluid Bolus
                     </button>
                     <button class="ctrl-btn ctrl-btn-bovie" onclick="sendAction('artifact', {duration: 6.0})">
-                        📻 Bovie Electrocautery Burst
+                        📻 Bovie Electrocautery
                     </button>
                 </div>
 
-                <div style="font-size: 0.8rem; font-weight: 700; color: var(--text-muted); margin-bottom: 6px;">SURGICAL LIFECYCLE FSM TRANSITIONS:</div>
-                <div style="display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px;">
+                <div class="section-label">SURGICAL LIFECYCLE FSM TRANSITIONS:</div>
+                <div class="stage-grid">
                     <button class="stage-pill" id="pill-STAGE_0_STANDBY" onclick="sendAction('stage', {stage: 'STAGE_0_STANDBY'})">
                         0. Standby
                     </button>
                     <button class="stage-pill" id="pill-STAGE_1_INDUCTION" onclick="sendAction('stage', {stage: 'STAGE_1_INDUCTION'})">
-                        1. Induction Bolus
+                        1. Induction
                     </button>
                     <button class="stage-pill active" id="pill-STAGE_2_MAINTENANCE" onclick="sendAction('stage', {stage: 'STAGE_2_MAINTENANCE'})">
-                        2. Maintenance Ridge
+                        2. Maint.
                     </button>
                     <button class="stage-pill" id="pill-STAGE_3_EMERGENCE" onclick="sendAction('stage', {stage: 'STAGE_3_EMERGENCE'})">
-                        3. Emergence Clearance
+                        3. Emergence
                     </button>
                 </div>
 
-                <div style="display: flex; justify-content: space-between; align-items: center; border-top: 1px solid var(--border); padding-top: 10px;">
-                    <div style="display: flex; gap: 8px; align-items: center;">
-                        <span style="font-size: 0.8rem; color: var(--text-muted);">Engine Mode:</span>
+                <div class="toggles-row">
+                    <div style="display: flex; gap: 6px; align-items: center;">
+                        <span style="font-size: 0.72rem; color: var(--text-muted);">Mode:</span>
                         <button class="ctrl-btn" id="btn-toggle-mode" onclick="toggleEngineMode()">
                             Mode A (Digital Twin Sim)
                         </button>
                     </div>
-                    <div style="display: flex; gap: 8px; align-items: center;">
-                        <span style="font-size: 0.8rem; color: var(--text-muted);">Autonomy Gate:</span>
+                    <div style="display: flex; gap: 6px; align-items: center;">
+                        <span style="font-size: 0.72rem; color: var(--text-muted);">Autonomy:</span>
                         <button class="ctrl-btn" id="btn-toggle-autonomy" onclick="toggleAutonomy()">
                             Level 4 (Closed-Loop)
                         </button>
@@ -657,46 +783,48 @@ HTML_DASHBOARD_TEMPLATE = """
                 </div>
             </div>
 
-            <!-- Real-Time Explainable AI (XAI) Attribution Console -->
-            <div class="panel">
-                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-                    <h3 style="margin: 0;">Event-Triggered Explainability (XAI)</h3>
-                    <span style="font-size: 0.72rem; color: var(--blue);" id="xai-tag">LIVE ATTRIBUTION</span>
-                </div>
+            <!-- Panel 3: Real-Time Explainable AI (XAI) Attribution Console -->
+            <div class="panel-card" style="flex: 1; min-height: 0; display: flex; flex-direction: column; justify-content: space-between;">
+                <div>
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                        <span style="font-size: 0.8rem; font-weight: 700;">Event-Triggered Explainability (XAI)</span>
+                        <span style="font-size: 0.68rem; color: var(--blue);" id="xai-tag">LIVE ATTRIBUTION</span>
+                    </div>
 
-                <div style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 10px;">
-                    Primary Clinical Titration Driver:
-                    <div style="font-size: 0.95rem; font-weight: 700; color: #38bdf8; margin-top: 2px;" id="xai-driver">
-                        Bouillon Synergistic Ridge Titration
+                    <div style="font-size: 0.72rem; color: var(--text-muted); margin-bottom: 6px;">
+                        Primary Titration Driver:
+                        <div style="font-size: 0.85rem; font-weight: 700; color: #38bdf8; margin-top: 1px;" id="xai-driver">
+                            Bouillon Synergistic Ridge Titration
+                        </div>
+                    </div>
+
+                    <div class="xai-bar-wrap">
+                        <span style="width: 125px; color: var(--text-muted); font-size: 0.72rem;">Conformal MAP Risk:</span>
+                        <div class="xai-bar-track">
+                            <div class="xai-bar-fill" id="xai-bar-map" style="width: 35%; background: #f43f5e;"></div>
+                        </div>
+                        <span style="width: 32px; text-align: right; font-weight: 700; color: #f43f5e; font-size: 0.72rem;" id="xai-val-map">35%</span>
+                    </div>
+
+                    <div class="xai-bar-wrap">
+                        <span style="width: 125px; color: var(--text-muted); font-size: 0.72rem;">BIS Depth Deviation:</span>
+                        <div class="xai-bar-track">
+                            <div class="xai-bar-fill" id="xai-bar-bis" style="width: 25%; background: #38bdf8;"></div>
+                        </div>
+                        <span style="width: 32px; text-align: right; font-weight: 700; color: #38bdf8; font-size: 0.72rem;" id="xai-val-bis">25%</span>
+                    </div>
+
+                    <div class="xai-bar-wrap">
+                        <span style="width: 125px; color: var(--text-muted); font-size: 0.72rem;">Surgical Nociception:</span>
+                        <div class="xai-bar-track">
+                            <div class="xai-bar-fill" id="xai-bar-pain" style="width: 12%; background: #fbbf24;"></div>
+                        </div>
+                        <span style="width: 32px; text-align: right; font-weight: 700; color: #fbbf24; font-size: 0.72rem;" id="xai-val-pain">12%</span>
                     </div>
                 </div>
 
-                <div class="xai-bar-wrap">
-                    <span style="width: 140px; color: var(--text-muted); font-size: 0.78rem;">Conformal MAP Risk:</span>
-                    <div class="xai-bar-track">
-                        <div class="xai-bar-fill" id="xai-bar-map" style="width: 35%; background: #f43f5e;"></div>
-                    </div>
-                    <span style="width: 36px; text-align: right; font-weight: 700; color: #f43f5e;" id="xai-val-map">35%</span>
-                </div>
-
-                <div class="xai-bar-wrap">
-                    <span style="width: 140px; color: var(--text-muted); font-size: 0.78rem;">BIS Depth Deviation:</span>
-                    <div class="xai-bar-track">
-                        <div class="xai-bar-fill" id="xai-bar-bis" style="width: 25%; background: #38bdf8;"></div>
-                    </div>
-                    <span style="width: 36px; text-align: right; font-weight: 700; color: #38bdf8;" id="xai-val-bis">25%</span>
-                </div>
-
-                <div class="xai-bar-wrap">
-                    <span style="width: 140px; color: var(--text-muted); font-size: 0.78rem;">Surgical Nociception:</span>
-                    <div class="xai-bar-track">
-                        <div class="xai-bar-fill" id="xai-bar-pain" style="width: 12%; background: #fbbf24;"></div>
-                    </div>
-                    <span style="width: 36px; text-align: right; font-weight: 700; color: #fbbf24;" id="xai-val-pain">12%</span>
-                </div>
-
-                <div style="margin-top: 14px; font-size: 0.75rem; color: var(--text-muted); line-height: 1.4; border-top: 1px solid var(--border); padding-top: 8px;">
-                    • Attributions evaluated dynamically on relative gradient shift (>5% delta). Formulated under ISO 60601-1-10 explainability guidelines.
+                <div style="font-size: 0.68rem; color: var(--text-muted); line-height: 1.3; border-top: 1px solid var(--border); padding-top: 4px; margin-top: 4px;">
+                    • Attributions evaluated on relative gradient shift (&gt;5% delta) per ISO 60601-1-10 explainability standard.
                 </div>
             </div>
         </div>
@@ -715,13 +843,14 @@ HTML_DASHBOARD_TEMPLATE = """
 
         function resizeCanvas() {
             const rect = canvas.getBoundingClientRect();
-            canvas.width = rect.width > 100 ? rect.width : (canvas.clientWidth || 800);
-            canvas.height = rect.height > 50 ? rect.height : (canvas.clientHeight || 220);
+            canvas.width = rect.width > 50 ? rect.width : (canvas.clientWidth || 800);
+            canvas.height = rect.height > 50 ? rect.height : (canvas.clientHeight || 150);
             drawChart();
         }
         window.addEventListener('resize', resizeCanvas);
         window.addEventListener('DOMContentLoaded', resizeCanvas);
-        setTimeout(resizeCanvas, 100);
+        setTimeout(resizeCanvas, 50);
+        setTimeout(resizeCanvas, 200);
 
         function setConnectionState(state, text) {
             if (state === 'online') {
@@ -778,7 +907,6 @@ HTML_DASHBOARD_TEMPLATE = """
                     console.warn('WebSocket closed, switching to HTTP fallback polling...');
                     setConnectionState('polling', 'CENTRAL CO-PILOT LIVE (HTTP FALLBACK)');
                     startPollingFallback(suite);
-                    // Attempt WS reconnect after 3 seconds
                     setTimeout(() => {
                         if (currentSuite === suite) connectWS(suite);
                     }, 3000);
@@ -860,9 +988,9 @@ HTML_DASHBOARD_TEMPLATE = """
             document.getElementById('val-ppv').innerText = `${data.vitals.ppv_percent.toFixed(1)}%`;
             document.getElementById('stage-badge').innerText = data.badge;
 
-            document.getElementById('rate-prop').innerHTML = `${data.infusion_rates.propofol_mg_kg_h.toFixed(2)} <span style="font-size: 0.8rem; font-weight: 400;">mg/kg/h</span>`;
-            document.getElementById('rate-remi').innerHTML = `${data.infusion_rates.remifentanil_ug_kg_min.toFixed(3)} <span style="font-size: 0.8rem; font-weight: 400;">µg/kg/min</span>`;
-            document.getElementById('rate-norepi').innerHTML = `${data.infusion_rates.norepinephrine_ug_kg_min.toFixed(3)} <span style="font-size: 0.8rem; font-weight: 400;">µg/kg/min</span>`;
+            document.getElementById('rate-prop').innerHTML = `${data.infusion_rates.propofol_mg_kg_h.toFixed(2)} <span style="font-size: 0.7rem; font-weight: 400;">mg/kg/h</span>`;
+            document.getElementById('rate-remi').innerHTML = `${data.infusion_rates.remifentanil_ug_kg_min.toFixed(3)} <span style="font-size: 0.7rem; font-weight: 400;">µg/kg/min</span>`;
+            document.getElementById('rate-norepi').innerHTML = `${data.infusion_rates.norepinephrine_ug_kg_min.toFixed(3)} <span style="font-size: 0.7rem; font-weight: 400;">µg/kg/min</span>`;
 
             document.getElementById('interlock-text').innerText = data.predictions.interlock_message;
             document.getElementById('preload-txt').innerText = data.safety.preload_advisory;
