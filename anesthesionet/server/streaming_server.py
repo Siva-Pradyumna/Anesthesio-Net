@@ -209,6 +209,13 @@ def create_app() -> FastAPI:
     suites["OR-1"].engine.simulator.pk_remi.state[0] = 7.0
     suites["OR-1"].engine.simulator.pk_remi.state[3] = 1.5  # Ce Remifentanil = 1.5 ng/mL (Therapeutic)
 
+    # Prime OR-3 to Stage 3 Emergence stage (Emergence Clearance)
+    suites["OR-3"].controller.stage = SurgicalStage.STAGE_3_EMERGENCE
+    suites["OR-3"].engine.simulator.pk_prop.state[0] = 3.0
+    suites["OR-3"].engine.simulator.pk_prop.state[3] = 0.9  # Ce Propofol clearing (Awakening)
+    suites["OR-3"].engine.simulator.pk_remi.state[0] = 0.8
+    suites["OR-3"].engine.simulator.pk_remi.state[3] = 0.3
+
     @app.get("/", response_class=HTMLResponse)
     async def get_dashboard():
         return HTML_DASHBOARD_TEMPLATE
@@ -837,6 +844,14 @@ HTML_DASHBOARD_TEMPLATE = """
         let bisHistory = [];
         let mapHistory = [];
         let latestPredictions = null;
+
+        // Dedicated per-suite persistent telemetry buffers to isolate operating rooms
+        const suiteHistories = {
+            'OR-1': { bis: [], map: [] },
+            'OR-2': { bis: [], map: [] },
+            'OR-3': { bis: [], map: [] }
+        };
+
         const canvas = document.getElementById('chart-canvas');
         const ctx = canvas.getContext('2d');
         const connBadge = document.getElementById('conn-badge');
@@ -867,7 +882,12 @@ HTML_DASHBOARD_TEMPLATE = """
 
         function connectWS(suite) {
             if (ws) {
-                try { ws.close(); } catch(e) {}
+                try {
+                    ws.onmessage = null;
+                    ws.onerror = null;
+                    ws.onclose = null;
+                    ws.close();
+                } catch(e) {}
                 ws = null;
             }
             if (pollTimer) {
@@ -968,19 +988,39 @@ HTML_DASHBOARD_TEMPLATE = """
         }
 
         function switchSuite(suite) {
+            if (currentSuite === suite) return;
             currentSuite = suite;
             document.querySelectorAll('.tab-btn').forEach(btn => {
                 btn.classList.toggle('active', btn.innerText.includes(suite));
             });
             document.getElementById('suite-header').innerText = `Active Suite: ${suite}`;
-            bisHistory = [];
-            mapHistory = [];
+
+            // Instantly load this suite's isolated history buffer (eliminates cross-suite jump artifacts)
+            bisHistory = (suiteHistories[suite] && suiteHistories[suite].bis) ? suiteHistories[suite].bis : [];
+            mapHistory = (suiteHistories[suite] && suiteHistories[suite].map) ? suiteHistories[suite].map : [];
             drawChart();
             connectWS(suite);
         }
 
         function updateUI(data) {
             if (!data || !data.vitals) return;
+
+            // Route data to the correct operating suite buffer
+            const sId = data.suite_id || currentSuite;
+            if (!suiteHistories[sId]) {
+                suiteHistories[sId] = { bis: [], map: [] };
+            }
+            suiteHistories[sId].bis.push(data.vitals.filtered_bis);
+            suiteHistories[sId].map.push(data.vitals.filtered_map);
+            if (suiteHistories[sId].bis.length > 70) { 
+                suiteHistories[sId].bis.shift(); 
+                suiteHistories[sId].map.shift(); 
+            }
+
+            // Reject any in-flight packets that belong to a different suite than the active tab
+            if (data.suite_id && data.suite_id !== currentSuite) {
+                return;
+            }
 
             document.getElementById('val-bis').innerText = data.vitals.filtered_bis.toFixed(1);
             document.getElementById('val-map').innerText = data.vitals.filtered_map.toFixed(1);
@@ -1027,13 +1067,9 @@ HTML_DASHBOARD_TEMPLATE = """
 
             latestPredictions = data.predictions;
 
-            // Update buffers (up to 70 points for historical curve)
-            bisHistory.push(data.vitals.filtered_bis);
-            mapHistory.push(data.vitals.filtered_map);
-            if (bisHistory.length > 70) { 
-                bisHistory.shift(); 
-                mapHistory.shift(); 
-            }
+            // Link active chart buffers to current suite's isolated history
+            bisHistory = suiteHistories[currentSuite].bis;
+            mapHistory = suiteHistories[currentSuite].map;
 
             drawChart();
         }
