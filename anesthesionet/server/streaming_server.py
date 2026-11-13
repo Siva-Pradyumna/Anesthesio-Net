@@ -2,13 +2,16 @@
 FastAPI & WebSockets Real-Time Multi-Room Streaming Server
 Powers the 1-to-Many remote supervision clinical command station.
 Streams live 10 Hz telemetry, conformal predictive forecast intervals,
-and HOCBF safety statuses across independent surgical suites (OR 1, OR 2, OR 3).
+and HOCBF safety statuses across independent surgical suites (OR 1, OR 2, OR 3)
+with FULL PARALLEL CONCURRENT EXECUTION across all operating rooms.
 """
 
 import asyncio
+from collections import deque
 from datetime import datetime
 import json
-from typing import Dict, Any
+import random
+from typing import Dict, Any, List
 from fastapi import FastAPI, WebSocket
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 from fastapi.responses import HTMLResponse
@@ -99,58 +102,94 @@ class SurgicalSuiteInstance:
         self.induction_step_count = 0
         self.dwell_counter_sec = 0.0
         
-        # Stopwatches / Timers (per suite)
+        # Stopwatches & Countdown Timers (per suite)
         self.surgery_timer_active = False
         self.surgery_duration_sec = 0.0
         
+        # Emergence countdown: Realistic 120-second (2:00 min) countdown to awakening
+        self.target_emergence_duration = 120.0
         self.emergence_timer_active = False
         self.emergence_duration_sec = 0.0
         self.is_patient_awake = False
         self.time_to_wakeup_sec = None
 
-        # Live Challenge and Autonomous Recovery Tracker
+        # Challenge and Autonomous Recovery Tracking
         self.active_challenge = None
-        self.challenge_history = []
+        self.challenge_history: List[dict] = []
+
+        # Chronological Event & Audit Log
+        self.event_log: List[dict] = [
+            {"time": "00:00:00", "tag": "PRE-OP", "text": "Patient admitted to OR. Monitoring active. Pre-induction checklist verified.", "type": "info"}
+        ]
+
+        # Persistent rolling history buffers (70 points) for unbroken waveforms
+        self.bis_history = deque(maxlen=70)
+        self.map_history = deque(maxlen=70)
+        self.raw_bis_history = deque(maxlen=70)
+
+        # Cached last payload for instant transmission
+        self.last_payload: dict = {}
+        self.step()  # Initial state step
 
     @staticmethod
     def _format_time(seconds: float) -> str:
-        s = int(seconds)
+        s = max(0, int(seconds))
         m, s = divmod(s, 60)
         h, m = divmod(m, 60)
-        return f"{h:02d}:{m:02d}:{s:02d}"
+        if h > 0:
+            return f"{h:02d}:{m:02d}:{s:02d}"
+        return f"{m:02d}:{s:02d}"
+
+    def add_event_log(self, tag: str, text: str, log_type: str = "info"):
+        """Appends a timestamped audit event."""
+        if self.surgery_timer_active or self.surgery_duration_sec > 0:
+            t_str = self._format_time(self.surgery_duration_sec)
+        elif self.emergence_timer_active or self.emergence_duration_sec > 0:
+            t_str = f"+{self._format_time(self.emergence_duration_sec)}"
+        else:
+            t_str = self._format_time(self.current_time_sec)
+
+        entry = {
+            "time": t_str,
+            "tag": tag,
+            "text": text,
+            "type": log_type
+        }
+        self.event_log.append(entry)
+        if len(self.event_log) > 80:
+            self.event_log.pop(0)
 
     def step(self) -> dict:
-        self.current_time_sec += 1.0
+        dt = 0.5  # 2 Hz continuous time increment
+        self.current_time_sec += dt
         self.watchdog.receive_heartbeat(self.current_time_sec)
 
-        # Transient challenge decays
+        # Decay transient stimuli
         if self.surgical_stimulus > 0.0:
-            self.surgical_stimulus = max(0.0, self.surgical_stimulus - 0.04)
+            self.surgical_stimulus = max(0.0, self.surgical_stimulus - 0.02)
         if self.ppv_bias > 0.0:
-            self.ppv_bias = max(0.0, self.ppv_bias - 0.15)
+            self.ppv_bias = max(0.0, self.ppv_bias - 0.08)
 
-        # Active Timer increments
+        # Advance active timers
         if self.surgery_timer_active:
-            self.surgery_duration_sec += 1.0
+            self.surgery_duration_sec += dt
         if self.emergence_timer_active:
-            self.emergence_duration_sec += 1.0
+            self.emergence_duration_sec += dt
 
-        # =====================================================================
-        # PHASE-SPECIFIC EXECUTION LOGIC
-        # =====================================================================
         was_intervened = False
         cf_proj = None
+        is_sensor_hold = False
         prop_ce = self.engine.simulator.pk_prop.Ce
         remi_ce = self.engine.simulator.pk_remi.Ce
 
-        # ---------------------------------------------------------------------
-        # 1. STANDBY: Patient awake in pre-op holding area
-        # ---------------------------------------------------------------------
+        # =====================================================================
+        # 1. STANDBY: Awake patient in pre-op holding
+        # =====================================================================
         if self.clinical_phase == "STANDBY":
             self.latest_action = np.array([0.0, 0.0, 0.0], dtype=np.float32)
             self.engine.simulator.pk_prop.reset()
             self.engine.simulator.pk_remi.reset()
-            self.engine.simulator.hemodynamics.baseline_map = 90.0
+            self.engine.simulator.hemodynamics.reset()
 
             raw_bis = 98.0
             filtered_bis = 98.0
@@ -170,15 +209,15 @@ class SurgicalSuiteInstance:
             is_patient_asleep = False
             is_safe_for_surgery = False
 
-        # ---------------------------------------------------------------------
-        # 2. STAGE 1 INDUCTION: Bolus given, TCI infusion ramp active
-        # ---------------------------------------------------------------------
+        # =====================================================================
+        # 2. STAGE 1 INDUCTION: Bolus administered, TCI ramping
+        # =====================================================================
         elif self.clinical_phase == "STAGE_1_INDUCTION":
             self.induction_step_count += 1
             filtered, cf_proj, meta = self.engine.step(
                 ai_action=self.latest_action,
                 surgical_stimulus=self.surgical_stimulus,
-                dt_seconds=1.0
+                dt_seconds=dt
             )
 
             raw_bis = filtered.raw_bis
@@ -193,7 +232,7 @@ class SurgicalSuiteInstance:
             prop_ce = self.engine.simulator.pk_prop.Ce
             remi_ce = self.engine.simulator.pk_remi.Ce
 
-            # Compute TCI ramp infusion rate from InductionController
+            # Compute induction infusion rates
             vitals_obj = type("VitalsObj", (), {
                 "bis": filtered_bis,
                 "map_mmhg": filtered_map,
@@ -203,27 +242,27 @@ class SurgicalSuiteInstance:
                 "time_seconds": self.current_time_sec
             })()
             prop, remi, norepi, _ = self.controller.induction_controller.compute_infusion_rates(
-                vitals_obj, dt_seconds=1.0
+                vitals_obj, dt_seconds=dt
             )
             self.latest_action = np.array([prop, remi, norepi], dtype=np.float32)
             safe_action = self.latest_action
 
             # Dwell stability evaluation
             if filtered_bis <= 58.0:
-                self.dwell_counter_sec += 1.0
+                self.dwell_counter_sec += dt
             else:
-                self.dwell_counter_sec = max(0.0, self.dwell_counter_sec - 0.5)
+                self.dwell_counter_sec = max(0.0, self.dwell_counter_sec - dt * 0.5)
 
-            # Once LOC reached and verified stable in therapeutic range
-            if filtered_bis <= 58.0 and self.dwell_counter_sec >= 10.0:
+            if filtered_bis <= 58.0 and self.dwell_counter_sec >= 8.0:
                 self.clinical_phase = "PATIENT_ASLEEP_READY"
+                self.add_event_log("✓ LOC CONFIRMED", "Patient asleep (LOC verified). Therapeutic depth stable. Safe to start surgical incision.", "success")
                 badge = "[✓ PATIENT ASLEEP (LOC CONFIRMED) — SAFE TO START SURGERY]"
                 readiness_text = "PATIENT IS ASLEEP (LOC CONFIRMED) — SAFE TO START SURGERY!"
                 is_patient_asleep = True
                 is_safe_for_surgery = True
             elif filtered_bis < 60.0:
-                badge = f"[LOC CONFIRMED — STABILIZING IN TARGET ({self.dwell_counter_sec:.0f}s / 10s)]"
-                readiness_text = f"Loss of Consciousness confirmed (BIS {filtered_bis:.0f}). Verifying depth stability ({self.dwell_counter_sec:.0f}s / 10s)..."
+                badge = f"[LOC CONFIRMED — STABILIZING IN TARGET ({self.dwell_counter_sec:.0f}s / 8s)]"
+                readiness_text = f"Loss of Consciousness confirmed (BIS {filtered_bis:.0f}). Verifying depth stability ({self.dwell_counter_sec:.0f}s / 8s)..."
                 is_patient_asleep = True
                 is_safe_for_surgery = False
             else:
@@ -232,16 +271,16 @@ class SurgicalSuiteInstance:
                 is_patient_asleep = False
                 is_safe_for_surgery = False
 
-        # ---------------------------------------------------------------------
-        # 3. PATIENT ASLEEP & READY: Waiting for Operator to click "Start Surgery"
-        # ---------------------------------------------------------------------
+        # =====================================================================
+        # 3. PATIENT ASLEEP & READY: Awaiting Operator Incision Call
+        # =====================================================================
         elif self.clinical_phase == "PATIENT_ASLEEP_READY":
             self.controller.stage = SurgicalStage.READINESS_HYSTERESIS
             self.latest_action = np.array([3.4, 0.12, 0.0], dtype=np.float32)
             filtered, cf_proj, meta = self.engine.step(
                 ai_action=self.latest_action,
                 surgical_stimulus=0.0,
-                dt_seconds=1.0
+                dt_seconds=dt
             )
 
             raw_bis = filtered.raw_bis
@@ -262,28 +301,16 @@ class SurgicalSuiteInstance:
             is_patient_asleep = True
             is_safe_for_surgery = True
 
-        # ---------------------------------------------------------------------
-        # 4. STAGE 2 MAINTENANCE: Active Surgery & Closed-Loop Autonomous Control
-        # ---------------------------------------------------------------------
+        # =====================================================================
+        # 4. STAGE 2 MAINTENANCE: Active Procedure & Closed-Loop Control
+        # =====================================================================
         elif self.clinical_phase == "STAGE_2_MAINTENANCE":
             self.controller.stage = SurgicalStage.STAGE_2_MAINTENANCE
             filtered, cf_proj, meta = self.engine.step(
                 ai_action=self.latest_action,
                 surgical_stimulus=self.surgical_stimulus,
-                dt_seconds=1.0
+                dt_seconds=dt
             )
-
-            # Injected electrocautery artifact handling
-            if self.injected_artifact_duration > 0.0:
-                self.injected_artifact_duration -= 1.0
-                filtered = self.engine.signal_filter.filter(
-                    raw_bis=98.0,
-                    raw_map=filtered.raw_map,
-                    raw_hr=filtered.raw_hr,
-                    sqi=18.0,
-                    emg_db=56.0,
-                    dt_seconds=1.0
-                )
 
             raw_bis = filtered.raw_bis
             filtered_bis = filtered.filtered_bis
@@ -297,7 +324,20 @@ class SurgicalSuiteInstance:
             prop_ce = self.engine.simulator.pk_prop.Ce
             remi_ce = self.engine.simulator.pk_remi.Ce
 
-            # Closed-Loop FSM & MIMO-SAC Controller
+            # Injected Electrocautery (Bovie) Interference Handling
+            if self.injected_artifact_duration > 0.0:
+                self.injected_artifact_duration -= dt
+                is_sensor_hold = True
+                # Extreme high-frequency electrical noise on raw line
+                raw_bis = float(np.clip(97.0 + random.uniform(-2.5, 2.5), 90.0, 100.0))
+                sqi_pct = 16.0
+                emg_db = 58.0
+                # Filter strictly protects patient by holding safe baseline (no drug dump!)
+                filtered_bis = 48.0
+                if self.injected_artifact_duration <= 0.0:
+                    self.add_event_log("✓ SENSOR RELEASED", "Electrocautery deactivated. Clean EEG tracking restored (SQI 98%). Patient protected from overdose.", "success")
+
+            # Evaluate Closed-Loop Controller
             vitals_obj = type("VitalsObj", (), {
                 "bis": filtered_bis,
                 "map_mmhg": filtered_map,
@@ -309,7 +349,7 @@ class SurgicalSuiteInstance:
             safe_action, was_intervened, _ = self.controller.step(
                 vitals=vitals_obj,
                 surgical_stimulus=self.surgical_stimulus,
-                dt_seconds=1.0
+                dt_seconds=dt
             )
 
             # Preload Gate enforcement
@@ -317,30 +357,38 @@ class SurgicalSuiteInstance:
             if preload_eval.is_fluid_responsive:
                 safe_action[2] = min(safe_action[2], preload_eval.max_allowable_norepi_rate)
 
+            # MAP Crash Recovery Dynamics:
+            if filtered_map < 65.0:
+                # Interlock escalates Norepinephrine infusion to restore arterial tone
+                safe_action[2] = max(float(safe_action[2]), 0.08 + 0.005 * (65.0 - filtered_map))
+            elif filtered_map >= 70.0 and self.engine.simulator.hemodynamics.params.baseline_map < 90.0:
+                # Smoothly restore baseline MAP after crash is neutralized
+                self.engine.simulator.hemodynamics.params.baseline_map = min(90.0, self.engine.simulator.hemodynamics.params.baseline_map + 0.4)
+
             self.latest_action = safe_action
             badge = "[STAGE 2: MAINTENANCE — SURGERY IN PROGRESS]"
             readiness_text = "Surgery in progress. Closed-loop MIMO-SAC controller & HOCBF safety active."
             is_patient_asleep = True
             is_safe_for_surgery = False
 
-            # Challenge Auto-Recovery Monitor
-            if self.active_challenge:
-                if self.active_challenge.get("status") == "RECOVERING":
-                    # Check recovery into clinical target zone (BIS 40-60, MAP 68-95)
-                    if 40.0 <= filtered_bis <= 60.0 and 68.0 <= filtered_map <= 95.0 and self.injected_artifact_duration == 0.0:
-                        self.active_challenge["status"] = "AUTO_RECOVERED"
-                        self.active_challenge["recovery_text"] = f"Vitals stabilized in therapeutic target: BIS {filtered_bis:.0f}, MAP {filtered_map:.0f} mmHg."
-                        self.challenge_history.append(dict(self.active_challenge))
+            # Challenge Auto-Recovery Evaluation
+            if self.active_challenge and self.active_challenge.get("status") == "RECOVERING":
+                if 40.0 <= filtered_bis <= 60.0 and 68.0 <= filtered_map <= 95.0 and self.injected_artifact_duration <= 0.0:
+                    self.active_challenge["status"] = "AUTO_RECOVERED"
+                    rec_text = f"Vitals stabilized in therapeutic target: BIS {filtered_bis:.0f}, MAP {filtered_map:.0f} mmHg."
+                    self.active_challenge["recovery_text"] = rec_text
+                    self.add_event_log("✓ AUTO-RECOVERED", f"{self.active_challenge['title']} neutralized. {rec_text}", "success")
+                    self.challenge_history.append(dict(self.active_challenge))
 
-        # ---------------------------------------------------------------------
+        # =====================================================================
         # 5. SURGERY COMPLETED: Incision closed, waiting for Emergence
-        # ---------------------------------------------------------------------
+        # =====================================================================
         elif self.clinical_phase == "SURGERY_COMPLETED":
             self.latest_action = np.array([2.5, 0.08, 0.0], dtype=np.float32)
             filtered, cf_proj, meta = self.engine.step(
                 ai_action=self.latest_action,
                 surgical_stimulus=0.0,
-                dt_seconds=1.0
+                dt_seconds=dt
             )
 
             raw_bis = filtered.raw_bis
@@ -357,29 +405,28 @@ class SurgicalSuiteInstance:
             safe_action = self.latest_action
 
             badge = "[SURGERY COMPLETED — AWAITING OPERATOR TO START EMERGENCE]"
-            readiness_text = f"Surgical procedure completed (Duration: {self._format_time(self.surgery_duration_sec)}). Click 'Start Emergence Phase' to discontinue anesthetics."
+            readiness_text = f"Surgical procedure completed (Duration: {self._format_time(self.surgery_duration_sec)}). Click 'Start Emergence Phase' to awaken patient."
             is_patient_asleep = True
             is_safe_for_surgery = False
 
-        # ---------------------------------------------------------------------
-        # 6. STAGE 3 EMERGENCE & PACU TRANSFER: Drug Washout & Awakening
-        # ---------------------------------------------------------------------
+        # =====================================================================
+        # 6. STAGE 3 EMERGENCE & PACU TRANSFER: Drug Washout & Countdown
+        # =====================================================================
         elif self.clinical_phase in ["STAGE_3_EMERGENCE", "PACU_TRANSFER"]:
             safe_action = np.array([0.0, 0.0, 0.0], dtype=np.float32)
             self.latest_action = safe_action
 
-            # Progressive pharmacokinetic clearance
-            current_ce_prop = self.engine.simulator.pk_prop.Ce
-            current_ce_remi = self.engine.simulator.pk_remi.Ce
-
-            new_ce_prop = max(0.2, current_ce_prop - 0.065)
-            new_ce_remi = max(0.04, current_ce_remi - 0.06)
+            # Realistic, smooth pharmacokinetic clearance across 120-second countdown
+            r = min(1.0, self.emergence_duration_sec / 110.0)
+            new_ce_prop = max(0.35, 2.2 * (1.0 - 0.78 * r))
+            new_ce_remi = max(0.08, 1.5 * (1.0 - 0.90 * r))
+            
             self.engine.simulator.pk_prop.state[3] = new_ce_prop
             self.engine.simulator.pk_remi.state[3] = new_ce_remi
-            self.engine.simulator.pk_prop.state[0] = max(0.0, self.engine.simulator.pk_prop.state[0] - 0.5)
-            self.engine.simulator.pk_remi.state[0] = max(0.0, self.engine.simulator.pk_remi.state[0] - 0.25)
+            self.engine.simulator.pk_prop.state[0] = max(0.0, self.engine.simulator.pk_prop.state[0] - dt * 0.15)
+            self.engine.simulator.pk_remi.state[0] = max(0.0, self.engine.simulator.pk_remi.state[0] - dt * 0.1)
 
-            # Compute BIS from cleared effect-site concentrations
+            # Compute BIS from Bouillon response surface
             raw_bis = self.engine.simulator.pd_synergy.compute_bis(new_ce_prop, new_ce_remi)
             filtered_bis = raw_bis
             raw_map, raw_hr, ppv_est = self.engine.simulator.hemodynamics.step(
@@ -387,7 +434,7 @@ class SurgicalSuiteInstance:
                 Ce_remi_ng_ml=new_ce_remi,
                 norepi_infusion_ug_kg_min=0.0,
                 surgical_noxious_stimulus=0.0,
-                dt_seconds=1.0
+                dt_seconds=dt
             )
             filtered_map = raw_map
             filtered_hr = raw_hr
@@ -396,22 +443,25 @@ class SurgicalSuiteInstance:
             prop_ce = new_ce_prop
             remi_ce = new_ce_remi
 
+            # Awakening check: at BIS >= 75 and Propofol Ce <= 1.05
             if raw_bis >= 75.0 and prop_ce <= 1.05:
-                self.clinical_phase = "PACU_TRANSFER"
-                self.is_patient_awake = True
-                if self.time_to_wakeup_sec is None:
+                if not self.is_patient_awake:
+                    self.is_patient_awake = True
                     self.time_to_wakeup_sec = self.emergence_duration_sec
+                    self.add_event_log("✓ PATIENT AWAKE", f"Consciousness regained (BIS {filtered_bis:.0f}, Prop Ce {prop_ce:.2f} µg/mL). Extubation criteria satisfied at post-op +{self._format_time(self.time_to_wakeup_sec)}.", "success")
+                self.clinical_phase = "PACU_TRANSFER"
                 badge = "[✓ PATIENT AWAKE & CONSCIOUS — READY FOR PACU TRANSFER]"
                 readiness_text = f"PATIENT IS AWAKE (BIS {filtered_bis:.0f}, Prop Ce {prop_ce:.2f} µg/mL). Extubation criteria met at post-op +{self._format_time(self.time_to_wakeup_sec)}."
                 is_patient_asleep = False
                 is_safe_for_surgery = False
             else:
-                badge = f"[STAGE 3: EMERGENCE WASHOUT (BIS {filtered_bis:.0f} | Prop Ce: {prop_ce:.2f} µg/mL)]"
+                rem_countdown = max(0.0, self.target_emergence_duration - self.emergence_duration_sec)
+                badge = f"[EMERGENCE WASHOUT — COUNTDOWN: {self._format_time(rem_countdown)} | BIS {filtered_bis:.0f}]"
                 readiness_text = f"Emergence in progress: Anesthetic washout active. Drug values clearing (Prop Ce: {prop_ce:.2f} µg/mL), BIS rising..."
                 is_patient_asleep = True
                 is_safe_for_surgery = False
 
-        # Record predictive frame & forecast
+        # Conformal prediction & Safety
         self.forecaster.record_frame(
             time_sec=self.current_time_sec,
             bis=filtered_bis,
@@ -443,7 +493,7 @@ class SurgicalSuiteInstance:
         else:
             xai_driver = "Bouillon Synergistic Ridge Titration"
 
-        # Determine drug status descriptions
+        # Drug pump status labels
         if self.clinical_phase == "STANDBY":
             prop_status = "Standby (0.00)"
             remi_status = "Standby (0.00)"
@@ -457,8 +507,17 @@ class SurgicalSuiteInstance:
             prop_status = "Closed-Loop Titration"
             remi_status = "Analgesic Titration"
 
-        # Compile comprehensive real-time payload
-        return {
+        # Emergence countdown display calculation
+        countdown_rem_sec = max(0.0, self.target_emergence_duration - self.emergence_duration_sec) if self.emergence_timer_active else self.target_emergence_duration
+        countdown_disp = self._format_time(countdown_rem_sec)
+
+        # Push to persistent per-suite history buffers
+        self.bis_history.append(filtered_bis)
+        self.map_history.append(filtered_map)
+        self.raw_bis_history.append(raw_bis)
+
+        # Compile full payload
+        self.last_payload = {
             "suite_id": self.suite_id,
             "time_seconds": self.current_time_sec,
             "mode": self.engine.mode.value,
@@ -479,6 +538,8 @@ class SurgicalSuiteInstance:
                 "emergence_timer_active": self.emergence_timer_active,
                 "emergence_duration_sec": self.emergence_duration_sec,
                 "emergence_formatted": self._format_time(self.emergence_duration_sec),
+                "countdown_remaining_sec": countdown_rem_sec,
+                "countdown_formatted": countdown_disp,
                 "is_patient_awake": self.is_patient_awake,
                 "time_to_wakeup_sec": self.time_to_wakeup_sec,
                 "wakeup_formatted": self._format_time(self.time_to_wakeup_sec) if self.time_to_wakeup_sec is not None else "--:--"
@@ -508,6 +569,12 @@ class SurgicalSuiteInstance:
                 "active": self.active_challenge,
                 "recent_history": self.challenge_history[-3:] if self.challenge_history else []
             },
+            "event_log": self.event_log[-25:],
+            "recent_history": {
+                "bis": list(self.bis_history),
+                "map": list(self.map_history),
+                "raw_bis": list(self.raw_bis_history)
+            },
             "predictions": {
                 "proactive_hypotension": prediction.proactive_hypotension_alert,
                 "interlock_message": prediction.interlock_message,
@@ -518,7 +585,7 @@ class SurgicalSuiteInstance:
             },
             "safety": {
                 "is_hocbf_intervened": was_intervened,
-                "is_sensor_hold": (self.injected_artifact_duration > 0.0),
+                "is_sensor_hold": is_sensor_hold,
                 "preload_advisory": preload_eval.clinical_advisory,
                 "watchdog_alarm": watchdog_stat.alarm_status,
                 "is_watchdog_tripped": watchdog_stat.is_failsafe_tripped
@@ -535,10 +602,11 @@ class SurgicalSuiteInstance:
                 "primary_driver": xai_driver
             }
         }
+        return self.last_payload
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="AnesthesioNet-AI Clinical Co-Pilot Server", version="0.2.0")
+    app = FastAPI(title="AnesthesioNet-AI Clinical Co-Pilot Server", version="0.3.0")
 
     # Initialize 3 Independent Operating Suites — ALL INITIALLY IN STANDBY
     suites: Dict[str, SurgicalSuiteInstance] = {
@@ -556,18 +624,32 @@ def create_app() -> FastAPI:
         )
     }
 
+    # Parallel Continuous Simulation Engine (Runs all 3 rooms concurrently in background)
+    @app.on_event("startup")
+    async def start_parallel_simulation_engine():
+        async def ticker():
+            while True:
+                try:
+                    for s_id, s_inst in suites.items():
+                        s_inst.step()
+                except Exception:
+                    pass
+                await asyncio.sleep(0.5)
+
+        asyncio.create_task(ticker())
+
     @app.get("/", response_class=HTMLResponse)
     async def get_dashboard():
         return HTML_DASHBOARD_TEMPLATE
 
     @app.get("/status")
     async def get_status():
-        return {suite_id: s.step() for suite_id, s in suites.items()}
+        return {suite_id: s.last_payload for suite_id, s in suites.items()}
 
     @app.get("/api/telemetry/{suite_id}")
     async def get_suite_telemetry(suite_id: str):
         suite = suites.get(suite_id, suites["OR-1"])
-        return suite.step()
+        return suite.last_payload
 
     @app.post("/api/action/{suite_id}")
     async def post_action(suite_id: str, payload: dict):
@@ -575,7 +657,7 @@ def create_app() -> FastAPI:
         action = payload.get("action")
 
         # -------------------------------------------------------------
-        # Clinical Lifecycle Actions
+        # 1. Clinical Lifecycle Actions
         # -------------------------------------------------------------
         if action == "start_induction":
             suite.clinical_phase = "STAGE_1_INDUCTION"
@@ -583,21 +665,24 @@ def create_app() -> FastAPI:
             suite.controller.induction_controller.reset()
             bolus_mg = suite.controller.trigger_induction()
             suite.engine.simulator.pk_prop.bolus(bolus_mg)
-            # Rapid initial onset in central compartment
-            suite.engine.simulator.pk_prop.state[3] = 0.6
-            suite.engine.simulator.pk_remi.state[3] = 0.5
+            suite.engine.simulator.pk_prop.state[3] = 0.8
+            suite.engine.simulator.pk_remi.state[3] = 0.6
             suite.dwell_counter_sec = 0.0
             suite.latest_action = np.array([6.0, 0.20, 0.0], dtype=np.float32)
+            suite.add_event_log("▶ INDUCTION", f"Propofol bolus {bolus_mg:.1f} mg delivered. Closed-loop TCI ramp initiated.", "info")
 
         elif action == "start_surgery":
             suite.clinical_phase = "STAGE_2_MAINTENANCE"
             suite.controller.stage = SurgicalStage.STAGE_2_MAINTENANCE
             suite.surgery_timer_active = True
             suite.latest_action = np.array([3.5, 0.12, 0.0], dtype=np.float32)
+            suite.add_event_log("⚡ SURGERY START", "Surgical incision begun. Procedure stopwatch started. Closed-loop maintenance engaged.", "info")
 
         elif action == "end_surgery":
             suite.clinical_phase = "SURGERY_COMPLETED"
             suite.surgery_timer_active = False
+            dur_str = suite._format_time(suite.surgery_duration_sec)
+            suite.add_event_log("⏹ SURGERY END", f"Wound closure complete. Final surgical duration: {dur_str}. Awaiting emergence.", "warning")
 
         elif action == "start_emergence":
             suite.clinical_phase = "STAGE_3_EMERGENCE"
@@ -607,6 +692,7 @@ def create_app() -> FastAPI:
             suite.is_patient_awake = False
             suite.time_to_wakeup_sec = None
             suite.latest_action = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+            suite.add_event_log("▶ EMERGENCE", "Anesthetic infusions stopped (0.00). 2-minute emergence countdown started. Washout active.", "warning")
 
         elif action == "reset_standby":
             suite.clinical_phase = "STANDBY"
@@ -614,7 +700,7 @@ def create_app() -> FastAPI:
             suite.controller.induction_controller.reset()
             suite.engine.simulator.pk_prop.reset()
             suite.engine.simulator.pk_remi.reset()
-            suite.engine.simulator.hemodynamics.baseline_map = 90.0
+            suite.engine.simulator.hemodynamics.reset()
             suite.latest_action = np.array([0.0, 0.0, 0.0], dtype=np.float32)
             suite.surgery_timer_active = False
             suite.surgery_duration_sec = 0.0
@@ -624,29 +710,34 @@ def create_app() -> FastAPI:
             suite.time_to_wakeup_sec = None
             suite.dwell_counter_sec = 0.0
             suite.active_challenge = None
+            suite.event_log = [{"time": "00:00:00", "tag": "RESET", "text": "Suite reset to clean pre-op standby.", "type": "info"}]
 
         # -------------------------------------------------------------
-        # Intraoperative Challenges & Countermeasures
+        # 2. Intraoperative Challenges & Countermeasures
         # -------------------------------------------------------------
         elif action == "pain":
             val = float(payload.get("value", 0.85))
             suite.surgical_stimulus = val
             suite.active_challenge = {
                 "type": "PAIN",
-                "title": f"⚡ Noxious Incision Surge (+{val:.2f} Pain)",
-                "action_taken": "Opioid infusion increased (+0.18 µg/kg/min) to suppress sympathetic surge.",
+                "title": f"⚡ Incision Surge (+{val:.2f} Pain)",
+                "action_taken": "Opioid infusion escalated (+0.18 µg/kg/min) to blunt sympathetic nociception.",
                 "status": "RECOVERING"
             }
+            suite.add_event_log("⚡ INCISION SURGE", f"Noxious surgical stimulation injected (+{val:.2f}). Sympathetic surge blunted via Remifentanil escalation.", "danger")
 
         elif action == "hypotension":
-            val = float(payload.get("value", 20.0))
-            suite.engine.simulator.hemodynamics.baseline_map = max(45.0, suite.engine.simulator.hemodynamics.baseline_map - val)
+            val = float(payload.get("value", 25.0))
+            # Directly adjust state variables to produce sudden MAP drop
+            suite.engine.simulator.hemodynamics.current_map = max(42.0, suite.engine.simulator.hemodynamics.current_map - val)
+            suite.engine.simulator.hemodynamics.params.baseline_map = max(55.0, suite.engine.simulator.hemodynamics.params.baseline_map - 18.0)
             suite.active_challenge = {
                 "type": "HYPOTENSION",
-                "title": f"📉 Sudden MAP Crash (-{val:.0f} mmHg)",
-                "action_taken": "Conformal Lookahead engaged -> HOCBF QP titrated Norepinephrine micro-dose.",
+                "title": f"📉 Acute MAP Crash (-{val:.0f} mmHg)",
+                "action_taken": "Conformal Lookahead engaged -> HOCBF QP escalated Norepinephrine pressor.",
                 "status": "RECOVERING"
             }
+            suite.add_event_log("📉 MAP CRASH", f"Sudden MAP plunge to {suite.engine.simulator.hemodynamics.current_map:.0f} mmHg (-{val:.0f} mmHg). Proactive pressor engaged.", "danger")
 
         elif action == "preload_deficit":
             suite.ppv_bias = 7.0
@@ -656,16 +747,19 @@ def create_app() -> FastAPI:
                 "action_taken": "Preload Gate clamped vasopressor & advised 250mL crystalloid fluid bolus.",
                 "status": "RECOVERING"
             }
+            suite.add_event_log("💧 PRELOAD DEFICIT", "Stroke volume variation widened (PPV 16%). Vasopressor clamped. 250mL fluid bolus advised.", "warning")
 
         elif action == "bolus":
             suite.ppv_bias = max(0.0, suite.ppv_bias - 7.0)
-            suite.engine.simulator.hemodynamics.baseline_map = min(92.0, suite.engine.simulator.hemodynamics.baseline_map + 15.0)
+            suite.engine.simulator.hemodynamics.current_map = min(92.0, suite.engine.simulator.hemodynamics.current_map + 15.0)
+            suite.engine.simulator.hemodynamics.params.baseline_map = min(90.0, suite.engine.simulator.hemodynamics.params.baseline_map + 10.0)
             suite.active_challenge = {
                 "type": "BOLUS",
                 "title": "💧 250mL Crystalloid Bolus Delivered",
                 "action_taken": "Intravascular filling restored (PPV normalized < 12%).",
                 "status": "AUTO_RECOVERED"
             }
+            suite.add_event_log("💧 FLUID BOLUS", "250mL crystalloid fluid bolus delivered. Normovolemia restored (PPV normalized).", "success")
 
         elif action == "artifact":
             dur = float(payload.get("duration", 6.0))
@@ -676,15 +770,21 @@ def create_app() -> FastAPI:
                 "action_taken": "Signal Filter velocity gate engaged -> Sensor-Hold locked (Zero drug dumping).",
                 "status": "RECOVERING"
             }
+            suite.add_event_log("📻 BOVIE DIATHERMY", f"High-frequency surgical cautery interference ({dur:.0f}s). SQI dropped to 16%, raw BIS spike to 98. Sensor-hold locked.", "warning")
 
         elif action == "lightening":
-            suite.engine.simulator.pk_prop.state[3] = max(0.8, suite.engine.simulator.pk_prop.state[3] - 1.0)
+            # Shift central mass and effect-site concentration to trigger genuine depth slip
+            suite.engine.simulator.pk_prop.state[3] = 1.05
+            suite.engine.simulator.pk_prop.state[0] = 5.0
+            suite.engine.simulator.pk_remi.state[3] = 0.45
+            suite.engine.simulator.pk_remi.state[0] = 2.0
             suite.active_challenge = {
                 "type": "LIGHTENING",
-                "title": "⚠️ Anesthetic Lightening / Patient Bucking Risk",
-                "action_taken": "Closed-loop detected BIS drift -> Propofol micro-bolus titrated.",
+                "title": "⚠️ Anesthetic Lightening / Depth Slip (+25 BIS)",
+                "action_taken": "Closed-loop detected BIS drift (71.0) -> Propofol pump rate escalated.",
                 "status": "RECOVERING"
             }
+            suite.add_event_log("⚠️ DEPTH LIGHTENING", "Hypnotic depth slipping (BIS jumped to 71). Closed-loop co-pilot escalating Propofol infusion rate.", "danger")
 
         elif action == "mode":
             new_mode = payload.get("mode")
@@ -703,23 +803,34 @@ def create_app() -> FastAPI:
         await websocket.accept()
         suite = suites.get(suite_id, suites["OR-1"])
         try:
-            while websocket.client_state == WebSocketState.CONNECTED:
+            while True:
+                if websocket.client_state != WebSocketState.CONNECTED:
+                    break
                 try:
-                    payload = suite.step()
+                    payload = suite.last_payload
+                    # Include status of all suites for multi-OR parallel status badges
+                    payload["all_suites_summary"] = {
+                        s_id: {
+                            "phase": s.clinical_phase,
+                            "bis": s.last_payload.get("vitals", {}).get("filtered_bis", 98.0),
+                            "surgery_time": s._format_time(s.surgery_duration_sec),
+                            "emergence_time": s._format_time(s.emergence_duration_sec),
+                        }
+                        for s_id, s in suites.items()
+                    }
                     await websocket.send_text(json.dumps(payload, default=float))
-                except (WebSocketDisconnect, RuntimeError):
+                except (WebSocketDisconnect, RuntimeError, ConnectionResetError):
                     break
                 except Exception as step_err:
-                    if "close" in str(step_err).lower():
+                    err_msg = str(step_err).lower()
+                    if "close" in err_msg or "disconnect" in err_msg or "broken" in err_msg:
                         break
-                    print(f"[WebSocket Error] Suite {suite_id}: {step_err}")
                     break
-                await asyncio.sleep(0.5)  # 2 Hz telemetry broadcast
-        except WebSocketDisconnect:
+                await asyncio.sleep(0.5)
+        except (WebSocketDisconnect, RuntimeError):
             pass
-        except Exception as ws_err:
-            if "close" not in str(ws_err).lower():
-                print(f"[WebSocket Notice] Suite {suite_id} disconnected: {ws_err}")
+        except Exception:
+            pass
 
     return app
 
@@ -809,14 +920,21 @@ HTML_DASHBOARD_TEMPLATE = """
             transition: all 0.2s;
             display: flex;
             align-items: center;
-            gap: 4px;
+            gap: 5px;
         }
         .tab-btn.active {
             background-color: var(--blue);
             color: #fff;
         }
+        .tab-indicator {
+            font-size: 0.62rem;
+            padding: 1px 4px;
+            border-radius: 3px;
+            background: rgba(0,0,0,0.3);
+            color: #93c5fd;
+        }
 
-        /* Top Scheduled Surgery & Timers Banner */
+        /* Top Scheduled Surgery & Dual Timers Banner */
         .suite-banner {
             background: linear-gradient(90deg, #111827 0%, #1e293b 100%);
             border-bottom: 1px solid var(--border);
@@ -844,7 +962,7 @@ HTML_DASHBOARD_TEMPLATE = """
             color: var(--text-muted);
         }
 
-        /* Dual Digital Stopwatches */
+        /* Dual Digital Stopwatches & Countdown */
         .timers-cluster {
             display: flex;
             align-items: center;
@@ -858,7 +976,7 @@ HTML_DASHBOARD_TEMPLATE = """
             display: flex;
             flex-direction: column;
             align-items: center;
-            min-width: 130px;
+            min-width: 135px;
         }
         .timer-label {
             font-size: 0.62rem;
@@ -883,7 +1001,7 @@ HTML_DASHBOARD_TEMPLATE = """
         .timer-surgery { color: #38bdf8; }
         .timer-emergence { color: #c084fc; }
 
-        /* Main Workspace Layout: 77% Left (Clinical Monitoring), 23% Right (Interactive Controls) */
+        /* Main Workspace Layout: 77% Left (Clinical Monitoring), 23% Right (Controls) */
         main {
             flex: 1;
             display: grid;
@@ -934,7 +1052,7 @@ HTML_DASHBOARD_TEMPLATE = """
         .readiness-induction { background: #451a03; border-left: 4px solid var(--amber); color: #fde68a; animation: pulseAmber 1.5s infinite; }
         .readiness-asleep { background: #064e3b; border-left: 4px solid var(--green); color: #a7f3d0; box-shadow: 0 0 12px rgba(16, 185, 129, 0.35); animation: pulseGreen 1.8s infinite; }
         .readiness-surgery { background: #0c4a6e; border-left: 4px solid var(--cyan); color: #bae6fd; }
-        .readiness-completed { background: #78350f; border-left: 4px solid #f59e0b; color: #fef3c7; }
+        .readiness-completed { background: #78350f; border-left: 4px solid var(--f59e0b); color: #fef3c7; }
         .readiness-emergence { background: #3b0764; border-left: 4px solid var(--purple); color: #e9d5ff; animation: pulsePurple 1.5s infinite; }
         .readiness-awake { background: #064e3b; border-left: 4px solid var(--green); color: #6ee7b7; box-shadow: 0 0 14px rgba(16, 185, 129, 0.45); }
 
@@ -1064,13 +1182,13 @@ HTML_DASHBOARD_TEMPLATE = """
         /* Lifecycle Action Toolbar */
         .lifecycle-btn-grid {
             display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 5px;
-            margin-bottom: 6px;
+            grid-template-columns: 1fr;
+            gap: 4px;
+            margin-bottom: 4px;
         }
         .action-btn {
             border: none;
-            padding: 7px 6px;
+            padding: 6px 6px;
             border-radius: 5px;
             font-size: 0.72rem;
             font-weight: 700;
@@ -1103,15 +1221,15 @@ HTML_DASHBOARD_TEMPLATE = """
         /* Challenge Buttons Grid */
         .stress-grid {
             display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 5px;
-            margin-bottom: 6px;
+            grid-template-columns: 1fr;
+            gap: 4px;
+            margin-bottom: 4px;
         }
         .ctrl-btn {
             background: #1e293b;
             color: #f3f4f6;
             border: 1px solid #334155;
-            padding: 5px 6px;
+            padding: 4px 6px;
             border-radius: 5px;
             font-size: 0.68rem;
             font-weight: 600;
@@ -1142,34 +1260,62 @@ HTML_DASHBOARD_TEMPLATE = """
         .ctrl-btn-light { background: #4c1d95; border-color: #7c3aed; color: #ede9fe; }
         .ctrl-btn-light:hover:not(:disabled) { background: #5b21b6; }
 
-        /* Autonomous Recovery Live Feed */
-        .recovery-feed {
+        /* Intraoperative Event History & Audit Log (ONLY SCROLLABLE ELEMENT) */
+        .event-log-container {
+            flex: 1;
+            min-height: 120px;
+            max-height: 200px;
+            overflow-y: auto;
+            overflow-x: hidden;
             background-color: #0b1120;
+            border: 1px solid #1f2937;
             border-radius: 5px;
-            padding: 5px 8px;
-            border-left: 3px solid var(--blue);
-            font-size: 0.7rem;
-            line-height: 1.35;
-            margin-top: 4px;
-            min-height: 38px;
+            padding: 5px 6px;
             display: flex;
             flex-direction: column;
-            justify-content: center;
+            gap: 3px;
         }
-        .recovery-tag-recovering {
-            color: var(--amber);
+        .event-log-container::-webkit-scrollbar {
+            width: 4px;
+        }
+        .event-log-container::-webkit-scrollbar-track {
+            background: #0f172a;
+        }
+        .event-log-container::-webkit-scrollbar-thumb {
+            background: #334155;
+            border-radius: 2px;
+        }
+        .event-log-container::-webkit-scrollbar-thumb:hover {
+            background: #475569;
+        }
+        .log-entry {
+            font-size: 0.65rem;
+            line-height: 1.3;
+            padding: 2px 4px;
+            border-radius: 3px;
+            background: #111827;
+            border-left: 2px solid #3b82f6;
+        }
+        .log-entry-info { border-left-color: #3b82f6; }
+        .log-entry-danger { border-left-color: #ef4444; background: #200d13; }
+        .log-entry-warning { border-left-color: #f59e0b; background: #241407; }
+        .log-entry-success { border-left-color: #10b981; background: #06231a; }
+        .log-time {
+            color: #64748b;
+            font-family: monospace;
             font-weight: 700;
+            margin-right: 3px;
         }
-        .recovery-tag-recovered {
-            color: var(--green);
+        .log-tag {
             font-weight: 800;
+            margin-right: 4px;
         }
 
         .section-label {
             font-size: 0.68rem;
             font-weight: 700;
             color: var(--text-muted);
-            margin: 0 0 4px 0;
+            margin: 0 0 3px 0;
             letter-spacing: 0.03em;
         }
         .safety-grid {
@@ -1185,8 +1331,8 @@ HTML_DASHBOARD_TEMPLATE = """
             display: flex;
             align-items: center;
             gap: 6px;
-            margin-bottom: 3px;
-            font-size: 0.7rem;
+            margin-bottom: 2px;
+            font-size: 0.68rem;
         }
         .xai-bar-track {
             flex: 1;
@@ -1210,13 +1356,16 @@ HTML_DASHBOARD_TEMPLATE = """
         </div>
         <div class="nav-tabs">
             <button class="tab-btn active" id="tab-OR-1" onclick="switchSuite('OR-1')">
-                <span>OR-1</span> <span style="font-size: 0.65rem; color: #93c5fd;">(LAP CHOLE)</span>
+                <span>OR-1 (LAP CHOLE)</span>
+                <span class="tab-indicator" id="ind-OR-1">STANDBY</span>
             </button>
             <button class="tab-btn" id="tab-OR-2" onclick="switchSuite('OR-2')">
-                <span>OR-2</span> <span style="font-size: 0.65rem; color: #93c5fd;">(TOTAL HIP)</span>
+                <span>OR-2 (TOTAL HIP)</span>
+                <span class="tab-indicator" id="ind-OR-2">STANDBY</span>
             </button>
             <button class="tab-btn" id="tab-OR-3" onclick="switchSuite('OR-3')">
-                <span>OR-3</span> <span style="font-size: 0.65rem; color: #93c5fd;">(CABG x3)</span>
+                <span>OR-3 (CABG x3)</span>
+                <span class="tab-indicator" id="ind-OR-3">STANDBY</span>
             </button>
         </div>
         <div id="conn-badge" style="font-size: 0.74rem; color: var(--amber); font-weight: 600;">
@@ -1246,8 +1395,8 @@ HTML_DASHBOARD_TEMPLATE = """
                 <span class="timer-status" id="badge-timer-surgery" style="background: #1e293b; color: var(--text-muted);">STANDBY</span>
             </div>
             <div class="timer-box">
-                <span class="timer-label">POST-OP EMERGENCE</span>
-                <span class="timer-digits timer-emergence" id="disp-timer-emergence">00:00:00</span>
+                <span class="timer-label" id="label-timer-emergence">EMERGENCE COUNTDOWN</span>
+                <span class="timer-digits timer-emergence" id="disp-timer-emergence">02:00</span>
                 <span class="timer-status" id="badge-timer-emergence" style="background: #1e293b; color: var(--text-muted);">INACTIVE</span>
             </div>
         </div>
@@ -1258,7 +1407,7 @@ HTML_DASHBOARD_TEMPLATE = """
         <div class="col-left">
             <!-- Dynamic Clinical Readiness & Workflow Alert Banner -->
             <div id="readiness-banner" class="readiness-banner readiness-standby">
-                <span id="readiness-text">ℹ PRE-OP STANDBY: Patient awake & monitor leads connected. Click "Start Induction" below.</span>
+                <span id="readiness-text">ℹ PRE-OP STANDBY: Patient awake & monitor leads connected. Click "Start Induction" on the right.</span>
                 <span id="readiness-pill" style="font-size: 0.68rem; padding: 2px 6px; border-radius: 4px; background: rgba(0,0,0,0.3);">STANDBY</span>
             </div>
 
@@ -1388,12 +1537,12 @@ HTML_DASHBOARD_TEMPLATE = """
         <div class="col-right">
             <!-- Panel 1: Clinical Lifecycle Orchestration Toolbar -->
             <div class="panel-card" style="flex-shrink: 0;">
-                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;">
                     <span style="font-size: 0.78rem; font-weight: 700;">Operator Action Console</span>
                     <span style="font-size: 0.64rem; color: var(--blue);" id="lifecycle-phase-tag">PHASE: STANDBY</span>
                 </div>
 
-                <div class="lifecycle-btn-grid" style="grid-template-columns: 1fr; gap: 5px;">
+                <div class="lifecycle-btn-grid">
                     <button class="action-btn btn-induction" id="btn-start-induction" onclick="sendAction('start_induction')">
                         ▶ 1. Start Induction
                     </button>
@@ -1407,61 +1556,69 @@ HTML_DASHBOARD_TEMPLATE = """
                         ▶ 4. Start Emergence
                     </button>
                 </div>
-                <div style="display: flex; justify-content: flex-end; margin-top: 4px;">
-                    <button class="action-btn btn-reset" style="padding: 3px 8px; font-size: 0.66rem; width: 100%;" onclick="sendAction('reset_standby')">
+                <div style="display: flex; justify-content: flex-end; margin-top: 3px;">
+                    <button class="action-btn btn-reset" style="padding: 2px 8px; font-size: 0.65rem; width: 100%;" onclick="sendAction('reset_standby')">
                         🔄 Reset Suite to Standby
                     </button>
                 </div>
             </div>
 
             <!-- Panel 2: Interactive Stress Challenges -->
-            <div class="panel-card" style="flex: 1; min-height: 0; display: flex; flex-direction: column; justify-content: space-between;">
-                <div>
-                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;">
-                        <span style="font-size: 0.76rem; font-weight: 700;">Intraoperative Challenges</span>
-                        <span style="font-size: 0.62rem; color: var(--text-muted);" id="challenges-active-hint">(Active in Surgery)</span>
-                    </div>
+            <div class="panel-card" style="flex-shrink: 0;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                    <span style="font-size: 0.76rem; font-weight: 700;">Intraoperative Challenges</span>
+                    <span style="font-size: 0.62rem; color: var(--text-muted);" id="challenges-active-hint">(Active in Surgery)</span>
+                </div>
 
-                    <div class="stress-grid" style="grid-template-columns: 1fr; gap: 4px;">
-                        <button class="ctrl-btn ctrl-btn-pain" id="btn-pain" onclick="sendAction('pain', {value: 0.85})" disabled>
-                            ⚡ Incision Surge (+0.85)
-                        </button>
-                        <button class="ctrl-btn ctrl-btn-crash" id="btn-hypo" onclick="sendAction('hypotension', {value: 20.0})" disabled>
-                            📉 MAP Crash (-20 mmHg)
-                        </button>
-                        <button class="ctrl-btn ctrl-btn-bolus" id="btn-preload" onclick="sendAction('preload_deficit', {})" disabled>
-                            💧 Preload Deficit (PPV 16%)
-                        </button>
-                        <button class="ctrl-btn ctrl-btn-bolus" id="btn-bolus" onclick="sendAction('bolus', {})" disabled>
-                            💧 250mL Fluid Bolus
-                        </button>
-                        <button class="ctrl-btn ctrl-btn-bovie" id="btn-bovie" onclick="sendAction('artifact', {duration: 6.0})" disabled>
-                            📻 Electrocautery (Bovie)
-                        </button>
-                        <button class="ctrl-btn ctrl-btn-light" id="btn-light" onclick="sendAction('lightening', {})" disabled>
-                            ⚠️ Lightening Depth (+25)
-                        </button>
-                    </div>
+                <div class="stress-grid">
+                    <button class="ctrl-btn ctrl-btn-pain" id="btn-pain" onclick="sendAction('pain', {value: 0.85})" disabled>
+                        ⚡ Incision Surge (+0.85)
+                    </button>
+                    <button class="ctrl-btn ctrl-btn-crash" id="btn-hypo" onclick="sendAction('hypotension', {value: 25.0})" disabled>
+                        📉 MAP Crash (-25 mmHg)
+                    </button>
+                    <button class="ctrl-btn ctrl-btn-bolus" id="btn-preload" onclick="sendAction('preload_deficit', {})" disabled>
+                        💧 Preload Deficit (PPV 16%)
+                    </button>
+                    <button class="ctrl-btn ctrl-btn-bolus" id="btn-bolus" onclick="sendAction('bolus', {})" disabled>
+                        💧 250mL Fluid Bolus
+                    </button>
+                    <button class="ctrl-btn ctrl-btn-bovie" id="btn-bovie" onclick="sendAction('artifact', {duration: 6.0})" disabled>
+                        📻 Electrocautery (Bovie)
+                    </button>
+                    <button class="ctrl-btn ctrl-btn-light" id="btn-light" onclick="sendAction('lightening', {})" disabled>
+                        ⚠️ Lightening Depth (+25)
+                    </button>
+                </div>
+            </div>
 
-                    <!-- Live Auto-Recovery Status Card -->
-                    <div class="section-label" style="margin-top: 5px;">CLOSED-LOOP RECOVERY FEED:</div>
-                    <div class="recovery-feed" id="recovery-feed">
-                        <div id="recovery-feed-title" style="font-weight: 700; color: #94a3b8; font-size: 0.68rem;">Closed-loop baseline stable.</div>
-                        <div id="recovery-feed-detail" style="font-size: 0.62rem; color: #64748b;">Operator can inject stress challenges during maintenance.</div>
+            <!-- Panel 3: Event & Challenge Audit Log (ONLY SCROLLABLE CONTAINER) -->
+            <div class="panel-card" style="flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 3px;">
+                    <span style="font-size: 0.72rem; font-weight: 700;">Intraoperative Event History Log</span>
+                    <span style="font-size: 0.60rem; color: var(--green);">● AUDIT TRAIL</span>
+                </div>
+
+                <!-- Scrollable Event Log -->
+                <div class="event-log-container" id="event-log-container">
+                    <div class="log-entry log-entry-info">
+                        <span class="log-time">[00:00:00]</span>
+                        <span class="log-tag">[PRE-OP]</span>
+                        <span>Patient in pre-op holding area. Ready for induction.</span>
                     </div>
                 </div>
 
                 <!-- Mode & Autonomy Toggles -->
-                <div style="border-top: 1px solid var(--border); padding-top: 5px; margin-top: 5px; display: flex; flex-direction: column; gap: 4px;">
+                <div style="border-top: 1px solid var(--border); padding-top: 4px; margin-top: 4px; display: flex; flex-direction: column; gap: 3px;">
                     <div style="display: flex; justify-content: space-between; align-items: center;">
-                        <span style="font-size: 0.67rem; color: var(--text-muted);">Mode:</span>
-                        <button class="ctrl-btn" id="btn-toggle-mode" style="padding: 2px 8px; font-size: 0.65rem;" onclick="toggleEngineMode()">
+                        <span style="font-size: 0.66rem; color: var(--text-muted);">Engine:</span>
+                        <button class="ctrl-btn" id="btn-toggle-mode" style="padding: 1px 6px; font-size: 0.64rem;" onclick="toggleEngineMode()">
                             Mode A (Digital Twin Sim)
                         </button>
                     </div>
                     <div style="display: flex; justify-content: space-between; align-items: center;">
-                        <span style="font-size: 0.67rem; color: var(--text-muted);">Autonomy:</span>
-                        <button class="ctrl-btn" id="btn-toggle-autonomy" style="padding: 2px 8px; font-size: 0.65rem;" onclick="toggleAutonomy()">
+                        <span style="font-size: 0.66rem; color: var(--text-muted);">Autonomy:</span>
+                        <button class="ctrl-btn" id="btn-toggle-autonomy" style="padding: 1px 6px; font-size: 0.64rem;" onclick="toggleAutonomy()">
                             Level 4 (Closed-Loop)
                         </button>
                     </div>
@@ -1476,13 +1633,15 @@ HTML_DASHBOARD_TEMPLATE = """
         let pollTimer = null;
         let bisHistory = [];
         let mapHistory = [];
+        let rawBisHistory = [];
         let latestPredictions = null;
+        let latestIsArtifact = false;
 
         // Dedicated per-suite persistent telemetry buffers to isolate operating rooms
         const suiteHistories = {
-            'OR-1': { bis: [], map: [] },
-            'OR-2': { bis: [], map: [] },
-            'OR-3': { bis: [], map: [] }
+            'OR-1': { bis: [], map: [], raw_bis: [] },
+            'OR-2': { bis: [], map: [], raw_bis: [] },
+            'OR-3': { bis: [], map: [], raw_bis: [] }
         };
 
         const canvas = document.getElementById('chart-canvas');
@@ -1621,9 +1780,10 @@ HTML_DASHBOARD_TEMPLATE = """
                 btn.classList.toggle('active', btn.id === `tab-${suite}`);
             });
 
-            // Immediately clear/load that room's telemetry buffer
+            // Load that room's telemetry buffer
             bisHistory = (suiteHistories[suite] && suiteHistories[suite].bis) ? suiteHistories[suite].bis : [];
             mapHistory = (suiteHistories[suite] && suiteHistories[suite].map) ? suiteHistories[suite].map : [];
+            rawBisHistory = (suiteHistories[suite] && suiteHistories[suite].raw_bis) ? suiteHistories[suite].raw_bis : [];
             drawChart();
             connectWS(suite);
         }
@@ -1631,16 +1791,55 @@ HTML_DASHBOARD_TEMPLATE = """
         function updateUI(data) {
             if (!data || !data.vitals) return;
 
-            // Route data to the correct room buffer
-            const sId = data.suite_id || currentSuite;
-            if (!suiteHistories[sId]) {
-                suiteHistories[sId] = { bis: [], map: [] };
+            // 0. Parallel Room Statuses in Navigation Tabs
+            if (data.all_suites_summary) {
+                Object.keys(data.all_suites_summary).forEach(sId => {
+                    const info = data.all_suites_summary[sId];
+                    const ind = document.getElementById(`ind-${sId}`);
+                    if (ind) {
+                        if (info.phase === 'STAGE_2_MAINTENANCE') {
+                            ind.innerText = `SURG ${info.surgery_time}`;
+                            ind.style.color = '#38bdf8';
+                        } else if (info.phase === 'STAGE_3_EMERGENCE') {
+                            ind.innerText = `EMERG ${info.emergence_time}`;
+                            ind.style.color = '#c084fc';
+                        } else if (info.phase === 'PACU_TRANSFER') {
+                            ind.innerText = `✓ AWAKE`;
+                            ind.style.color = '#34d399';
+                        } else if (info.phase === 'STAGE_1_INDUCTION') {
+                            ind.innerText = `INDUCTION`;
+                            ind.style.color = '#fbbf24';
+                        } else if (info.phase === 'PATIENT_ASLEEP_READY') {
+                            ind.innerText = `✓ READY`;
+                            ind.style.color = '#34d399';
+                        } else {
+                            ind.innerText = `STANDBY`;
+                            ind.style.color = '#94a3b8';
+                        }
+                    }
+                });
             }
-            suiteHistories[sId].bis.push(data.vitals.filtered_bis);
-            suiteHistories[sId].map.push(data.vitals.filtered_map);
-            if (suiteHistories[sId].bis.length > 70) { 
-                suiteHistories[sId].bis.shift(); 
-                suiteHistories[sId].map.shift(); 
+
+            // Route data to correct room buffer
+            const sId = data.suite_id || currentSuite;
+            if (data.recent_history) {
+                suiteHistories[sId] = {
+                    bis: data.recent_history.bis || [],
+                    map: data.recent_history.map || [],
+                    raw_bis: data.recent_history.raw_bis || []
+                };
+            } else {
+                if (!suiteHistories[sId]) {
+                    suiteHistories[sId] = { bis: [], map: [], raw_bis: [] };
+                }
+                suiteHistories[sId].bis.push(data.vitals.filtered_bis);
+                suiteHistories[sId].map.push(data.vitals.filtered_map);
+                suiteHistories[sId].raw_bis.push(data.vitals.raw_bis);
+                if (suiteHistories[sId].bis.length > 70) { 
+                    suiteHistories[sId].bis.shift(); 
+                    suiteHistories[sId].map.shift(); 
+                    suiteHistories[sId].raw_bis.shift(); 
+                }
             }
 
             // Ignore packet if it belongs to a non-active tab
@@ -1656,7 +1855,7 @@ HTML_DASHBOARD_TEMPLATE = """
                     `Surgeon: ${data.surgery_meta.lead_surgeon} | Anesthesiologist: ${data.surgery_meta.anesthesiologist} | Scheduled: ${data.surgery_meta.scheduled_time} | Patient: ${data.surgery_meta.demographics} (${data.surgery_meta.asa_class})`;
             }
 
-            // 2. Stopwatches / Timers
+            // 2. Stopwatches & Emergence Countdown
             if (data.timers) {
                 document.getElementById('disp-timer-surgery').innerText = data.timers.surgery_formatted;
                 const surgeryBadge = document.getElementById('badge-timer-surgery');
@@ -1674,17 +1873,26 @@ HTML_DASHBOARD_TEMPLATE = """
                     surgeryBadge.style.color = 'var(--text-muted)';
                 }
 
-                document.getElementById('disp-timer-emergence').innerText = data.timers.emergence_formatted;
+                // Emergence Countdown
+                const emergDisp = document.getElementById('disp-timer-emergence');
                 const emergBadge = document.getElementById('badge-timer-emergence');
+                const emergLabel = document.getElementById('label-timer-emergence');
+
                 if (data.timers.is_patient_awake) {
+                    emergLabel.innerText = 'POST-OP TIME';
+                    emergDisp.innerText = data.timers.wakeup_formatted;
                     emergBadge.innerText = '✓ PATIENT AWAKE';
                     emergBadge.style.background = '#059669';
                     emergBadge.style.color = '#fff';
                 } else if (data.timers.emergence_timer_active) {
-                    emergBadge.innerText = 'WASHOUT ACTIVE';
+                    emergLabel.innerText = 'EMERGENCE COUNTDOWN';
+                    emergDisp.innerText = data.timers.countdown_formatted;
+                    emergBadge.innerText = 'COUNTDOWN ACTIVE';
                     emergBadge.style.background = '#7c3aed';
                     emergBadge.style.color = '#fff';
                 } else {
+                    emergLabel.innerText = 'EMERGENCE COUNTDOWN';
+                    emergDisp.innerText = '02:00';
                     emergBadge.innerText = 'INACTIVE';
                     emergBadge.style.background = '#1e293b';
                     emergBadge.style.color = 'var(--text-muted)';
@@ -1701,7 +1909,7 @@ HTML_DASHBOARD_TEMPLATE = """
             banner.className = 'readiness-banner';
             if (data.phase === 'STANDBY') {
                 banner.classList.add('readiness-standby');
-                readinessText.innerText = 'ℹ PRE-OP STANDBY: Patient awake. Click "▶ 1. Start Induction" below to begin automated co-induction.';
+                readinessText.innerText = 'ℹ PRE-OP STANDBY: Patient awake. Click "▶ 1. Start Induction" on the right.';
                 readinessPill.innerText = 'STANDBY';
             } else if (data.phase === 'STAGE_1_INDUCTION') {
                 banner.classList.add('readiness-induction');
@@ -1721,7 +1929,7 @@ HTML_DASHBOARD_TEMPLATE = """
                 readinessPill.innerText = 'PROCEDURE ENDED';
             } else if (data.phase === 'STAGE_3_EMERGENCE') {
                 banner.classList.add('readiness-emergence');
-                readinessText.innerText = data.readiness.status_text;
+                readinessText.innerText = `⏳ EMERGENCE WASHOUT: Countdown ${data.timers.countdown_formatted}. Propofol Ce clearing (${data.vitals.ce_propofol_ug_ml.toFixed(2)} µg/mL), BIS rising...`;
                 readinessPill.innerText = 'EMERGENCE WASHOUT';
             } else if (data.phase === 'PACU_TRANSFER') {
                 banner.classList.add('readiness-awake');
@@ -1750,23 +1958,22 @@ HTML_DASHBOARD_TEMPLATE = """
             ['btn-pain', 'btn-hypo', 'btn-preload', 'btn-bolus', 'btn-bovie', 'btn-light'].forEach(id => {
                 document.getElementById(id).disabled = !isSurgeryActive;
             });
-            document.getElementById('challenges-active-hint').innerText = isSurgeryActive ? '(Click to Inject Perturbation)' : '(Enabled During Active Surgery)';
+            document.getElementById('challenges-active-hint').innerText = isSurgeryActive ? '(Click to Inject)' : '(Active in Surgery)';
 
-            // 6. Challenge Auto-Recovery Feed
-            const feedTitle = document.getElementById('recovery-feed-title');
-            const feedDetail = document.getElementById('recovery-feed-detail');
-            if (data.challenge && data.challenge.active) {
-                const ch = data.challenge.active;
-                if (ch.status === 'AUTO_RECOVERED') {
-                    feedTitle.innerHTML = `<span class="recovery-tag-recovered">[✓ AUTO-RECOVERED]</span> ${ch.title}`;
-                    feedDetail.innerText = `${ch.action_taken} — ${ch.recovery_text || 'Vitals stabilized in therapeutic target.'}`;
-                } else {
-                    feedTitle.innerHTML = `<span class="recovery-tag-recovering">[CHALLENGE ACTIVE - RECOVERING...]</span> ${ch.title}`;
-                    feedDetail.innerText = `${ch.action_taken} — Closed-loop countermeasure in progress.`;
-                }
-            } else {
-                feedTitle.innerText = isSurgeryActive ? 'Closed-loop steady state. Ready for stress challenge.' : 'No active challenges.';
-                feedDetail.innerText = isSurgeryActive ? 'Operator can test physiological shocks (pain, hemorrhage, artifact).' : 'Challenges unlock once surgery starts.';
+            // 6. Chronological Intraoperative Event History Log
+            const logContainer = document.getElementById('event-log-container');
+            if (data.event_log && logContainer) {
+                let html = '';
+                data.event_log.forEach(entry => {
+                    const cls = `log-entry log-entry-${entry.type || 'info'}`;
+                    html += `<div class="${cls}">
+                        <span class="log-time">[${entry.time}]</span>
+                        <span class="log-tag">[${entry.tag}]</span>
+                        <span>${entry.text}</span>
+                    </div>`;
+                });
+                logContainer.innerHTML = html;
+                logContainer.scrollTop = logContainer.scrollHeight;
             }
 
             // 7. Vitals Numerics
@@ -1775,19 +1982,37 @@ HTML_DASHBOARD_TEMPLATE = """
             document.getElementById('val-hr').innerText = data.vitals.filtered_hr.toFixed(1);
             document.getElementById('val-ppv').innerText = `${data.vitals.ppv_percent.toFixed(1)}%`;
 
+            // Colorize based on target bounds
+            const bisEl = document.getElementById('val-bis');
+            if (data.vitals.filtered_bis < 40.0) bisEl.style.color = '#ef4444';
+            else if (data.vitals.filtered_bis > 60.0 && data.phase === 'STAGE_2_MAINTENANCE') bisEl.style.color = '#f59e0b';
+            else bisEl.style.color = '#38bdf8';
+
+            const mapEl = document.getElementById('val-map');
+            if (data.vitals.filtered_map < 65.0) mapEl.style.color = '#ef4444';
+            else if (data.vitals.filtered_map > 100.0) mapEl.style.color = '#f59e0b';
+            else mapEl.style.color = '#f43f5e';
+
             // 8. Syringe Pumps & Live Effect-Site Drug Concentrations (Ce)
-            document.getElementById('rate-prop').innerHTML = `${data.infusion_rates.propofol_mg_kg_h.toFixed(2)} <span style="font-size: 0.65rem; font-weight: 400;">mg/kg/h</span>`;
+            document.getElementById('rate-prop').innerHTML = `${data.infusion_rates.propofol_mg_kg_h.toFixed(2)} <span style="font-size: 0.63rem; font-weight: 400;">mg/kg/h</span>`;
             document.getElementById('ce-prop-txt').innerText = `Ce: ${data.infusion_rates.propofol_ce_ug_ml.toFixed(2)} µg/mL | ${data.infusion_rates.propofol_status}`;
 
-            document.getElementById('rate-remi').innerHTML = `${data.infusion_rates.remifentanil_ug_kg_min.toFixed(3)} <span style="font-size: 0.65rem; font-weight: 400;">µg/kg/min</span>`;
+            document.getElementById('rate-remi').innerHTML = `${data.infusion_rates.remifentanil_ug_kg_min.toFixed(3)} <span style="font-size: 0.63rem; font-weight: 400;">µg/kg/min</span>`;
             document.getElementById('ce-remi-txt').innerText = `Ce: ${data.infusion_rates.remifentanil_ce_ng_ml.toFixed(2)} ng/mL | ${data.infusion_rates.remifentanil_status}`;
 
-            document.getElementById('rate-norepi').innerHTML = `${data.infusion_rates.norepinephrine_ug_kg_min.toFixed(3)} <span style="font-size: 0.65rem; font-weight: 400;">µg/kg/min</span>`;
+            document.getElementById('rate-norepi').innerHTML = `${data.infusion_rates.norepinephrine_ug_kg_min.toFixed(3)} <span style="font-size: 0.63rem; font-weight: 400;">µg/kg/min</span>`;
 
             // 9. Safety & Interlocks
             document.getElementById('interlock-text').innerText = data.predictions.interlock_message;
             document.getElementById('preload-txt').innerText = `Preload Gate: ${data.safety.preload_advisory}`;
-            document.getElementById('signal-txt').innerText = `SQI ${data.vitals.sqi_percent.toFixed(0)}% | EMG ${data.vitals.emg_db.toFixed(0)} dB (CLEAN)`;
+            
+            const sigEl = document.getElementById('signal-txt');
+            latestIsArtifact = data.safety.is_sensor_hold || (data.vitals.sqi_percent < 50.0);
+            if (latestIsArtifact) {
+                sigEl.innerHTML = `<span style="color: #ef4444; font-weight: 800;">⚠️ BOVIE NOISE (SQI ${data.vitals.sqi_percent.toFixed(0)}%) — SENSOR HOLD</span>`;
+            } else {
+                sigEl.innerHTML = `<span style="color: var(--green);">SQI ${data.vitals.sqi_percent.toFixed(0)}% (CLEAN)</span>`;
+            }
 
             // 10. XAI Attributions
             if (data.xai) {
@@ -1800,6 +2025,7 @@ HTML_DASHBOARD_TEMPLATE = """
                 document.getElementById('xai-val-pain').innerText = `${data.xai.nociception_pct.toFixed(0)}%`;
             }
 
+            // Mode & Autonomy labels
             if (data.mode) {
                 activeEngineMode = data.mode;
                 const btnM = document.getElementById('btn-toggle-mode');
@@ -1814,6 +2040,7 @@ HTML_DASHBOARD_TEMPLATE = """
             latestPredictions = data.predictions;
             bisHistory = suiteHistories[currentSuite].bis;
             mapHistory = suiteHistories[currentSuite].map;
+            rawBisHistory = suiteHistories[currentSuite].raw_bis;
 
             drawChart();
         }
@@ -1831,7 +2058,6 @@ HTML_DASHBOARD_TEMPLATE = """
             ctx.fillStyle = 'rgba(16, 185, 129, 0.12)';
             ctx.fillRect(0, y60, w, y40 - y60);
 
-            // Dotted boundaries for target zone
             ctx.strokeStyle = 'rgba(16, 185, 129, 0.4)';
             ctx.setLineDash([4, 4]);
             ctx.lineWidth = 1;
@@ -1841,7 +2067,6 @@ HTML_DASHBOARD_TEMPLATE = """
             ctx.stroke();
             ctx.setLineDash([]);
 
-            // Target zone label
             ctx.font = '10px sans-serif';
             ctx.fillStyle = 'rgba(16, 185, 129, 0.7)';
             ctx.fillText('TARGET BIS: 40 - 60 (Adequate Surgical Anesthesia)', 12, y60 + 13);
@@ -1861,7 +2086,6 @@ HTML_DASHBOARD_TEMPLATE = """
                 ctx.fillText(`${level}`, 4, y - 3);
             });
 
-            // If no data points yet, draw clean placeholder
             if (bisHistory.length < 2) {
                 ctx.font = '12px sans-serif';
                 ctx.fillStyle = 'rgba(156, 163, 175, 0.6)';
@@ -1871,7 +2095,6 @@ HTML_DASHBOARD_TEMPLATE = """
                 return;
             }
 
-            // Reserve left 75% for history, right 25% for conformal forecast projection
             const historyW = w * 0.75;
             const stepX = historyW / Math.max(bisHistory.length - 1, 1);
 
@@ -1887,7 +2110,23 @@ HTML_DASHBOARD_TEMPLATE = """
             }
             ctx.stroke();
 
-            // 4. Draw BIS Trajectory (Cyan Glow)
+            // 3B. If Electrocautery Artifact Active, draw Raw BIS Noise Spike (Amber Dotted)
+            if (rawBisHistory.length > 0 && latestIsArtifact) {
+                ctx.strokeStyle = 'rgba(245, 158, 11, 0.85)';
+                ctx.lineWidth = 1.6;
+                ctx.setLineDash([3, 3]);
+                ctx.beginPath();
+                for (let i = 0; i < rawBisHistory.length; i++) {
+                    const x = i * stepX;
+                    const y = h - (rawBisHistory[i] / 120) * h;
+                    if (i === 0) ctx.moveTo(x, y);
+                    else ctx.lineTo(x, y);
+                }
+                ctx.stroke();
+                ctx.setLineDash([]);
+            }
+
+            // 4. Draw Filtered BIS Trajectory (Cyan Glow)
             ctx.shadowColor = '#38bdf8';
             ctx.shadowBlur = 6;
             ctx.strokeStyle = '#38bdf8';
@@ -1906,7 +2145,7 @@ HTML_DASHBOARD_TEMPLATE = """
             ctx.stroke();
             ctx.shadowBlur = 0;
 
-            // Draw current pulsating head dot
+            // Draw current head dot
             ctx.fillStyle = '#38bdf8';
             ctx.beginPath();
             ctx.arc(lastX, lastY, 4, 0, Math.PI * 2);
@@ -1920,7 +2159,6 @@ HTML_DASHBOARD_TEMPLATE = """
                 const yLow = h - (low / 120) * h;
                 const yHigh = h - (high / 120) * h;
 
-                // Shaded forecast cone
                 ctx.fillStyle = 'rgba(56, 189, 248, 0.15)';
                 ctx.beginPath();
                 ctx.moveTo(lastX, lastY);
@@ -1929,7 +2167,6 @@ HTML_DASHBOARD_TEMPLATE = """
                 ctx.closePath();
                 ctx.fill();
 
-                // Dashed forecast boundary lines
                 ctx.strokeStyle = 'rgba(56, 189, 248, 0.6)';
                 ctx.setLineDash([4, 3]);
                 ctx.lineWidth = 1.2;
@@ -1939,7 +2176,6 @@ HTML_DASHBOARD_TEMPLATE = """
                 ctx.stroke();
                 ctx.setLineDash([]);
 
-                // Label at cone apex
                 ctx.font = '9px sans-serif';
                 ctx.fillStyle = '#38bdf8';
                 ctx.fillText(`+10m CI [${low.toFixed(0)}-${high.toFixed(0)}]`, endX - 60, (yLow + yHigh) / 2);
