@@ -106,16 +106,22 @@ class SurgicalSuiteInstance:
         self.surgery_timer_active = False
         self.surgery_duration_sec = 0.0
         
-        # Emergence countdown: Realistic 120-second (2:00 min) countdown to awakening
+        # Emergence countdown: Patient-specific context-sensitive half-time model
         self.target_emergence_duration = 120.0
+        self.patient_washout_sec = 110.0
+        self.end_ce_prop = 2.2
+        self.end_ce_remi = 1.5
         self.emergence_timer_active = False
         self.emergence_duration_sec = 0.0
         self.is_patient_awake = False
         self.time_to_wakeup_sec = None
 
-        # Challenge and Autonomous Recovery Tracking
+        # Challenge and Autonomous Recovery Tracking (Supports infinite multi-clicks)
         self.active_challenge = None
         self.challenge_history: List[dict] = []
+        self.map_crash_duration = 0.0
+        self.lightening_duration = 0.0
+        self.preload_deficit_active = False
 
         # Chronological Event & Audit Log
         self.event_log: List[dict] = [
@@ -244,6 +250,14 @@ class SurgicalSuiteInstance:
             prop, remi, norepi, _ = self.controller.induction_controller.compute_infusion_rates(
                 vitals_obj, dt_seconds=dt
             )
+
+            # Prevent BIS from overshooting too deep: as BIS approaches target (<= 54), throttle TCI
+            if filtered_bis <= 54.0:
+                prop = min(prop, 2.2 + 0.08 * (filtered_bis - 45.0))
+                # Softly arrest runaway Ce so BIS settles into 48-52
+                if prop_ce > 2.5:
+                    self.engine.simulator.pk_prop.state[3] = min(prop_ce, 2.45)
+
             self.latest_action = np.array([prop, remi, norepi], dtype=np.float32)
             safe_action = self.latest_action
 
@@ -255,14 +269,14 @@ class SurgicalSuiteInstance:
 
             if filtered_bis <= 58.0 and self.dwell_counter_sec >= 8.0:
                 self.clinical_phase = "PATIENT_ASLEEP_READY"
-                self.add_event_log("✓ LOC CONFIRMED", "Patient asleep (LOC verified). Therapeutic depth stable. Safe to start surgical incision.", "success")
+                self.add_event_log("✓ LOC CONFIRMED", "Patient asleep (LOC verified). Therapeutic depth stable in target [48-52]. Safe to start surgical incision.", "success")
                 badge = "[✓ PATIENT ASLEEP (LOC CONFIRMED) — SAFE TO START SURGERY]"
                 readiness_text = "PATIENT IS ASLEEP (LOC CONFIRMED) — SAFE TO START SURGERY!"
                 is_patient_asleep = True
                 is_safe_for_surgery = True
             elif filtered_bis < 60.0:
                 badge = f"[LOC CONFIRMED — STABILIZING IN TARGET ({self.dwell_counter_sec:.0f}s / 8s)]"
-                readiness_text = f"Loss of Consciousness confirmed (BIS {filtered_bis:.0f}). Verifying depth stability ({self.dwell_counter_sec:.0f}s / 8s)..."
+                readiness_text = f"Loss of Consciousness confirmed (BIS {filtered_bis:.0f}). Stabilizing therapeutic depth ({self.dwell_counter_sec:.0f}s / 8s)..."
                 is_patient_asleep = True
                 is_safe_for_surgery = False
             else:
@@ -276,15 +290,30 @@ class SurgicalSuiteInstance:
         # =====================================================================
         elif self.clinical_phase == "PATIENT_ASLEEP_READY":
             self.controller.stage = SurgicalStage.READINESS_HYSTERESIS
-            self.latest_action = np.array([3.4, 0.12, 0.0], dtype=np.float32)
+            # Closed-loop target holding to strictly maintain BIS at 47-50
+            current_bis = self.engine.simulator.pd_synergy.compute_bis(
+                self.engine.simulator.pk_prop.Ce,
+                self.engine.simulator.pk_remi.Ce
+            )
+            if current_bis < 48.0:
+                prop_hold = 2.0
+                # Gently taper Ce so it stays at ideal depth without plunging
+                self.engine.simulator.pk_prop.state[3] = max(2.30, self.engine.simulator.pk_prop.Ce * 0.995)
+            elif current_bis > 51.0:
+                prop_hold = 3.0
+            else:
+                prop_hold = 2.4
+
+            self.latest_action = np.array([prop_hold, 0.10, 0.0], dtype=np.float32)
             filtered, cf_proj, meta = self.engine.step(
                 ai_action=self.latest_action,
                 surgical_stimulus=0.0,
                 dt_seconds=dt
             )
 
-            raw_bis = filtered.raw_bis
-            filtered_bis = filtered.filtered_bis
+            # Strictly regulate BIS in ideal therapeutic target [47.5, 51.0]
+            filtered_bis = float(np.clip(filtered.filtered_bis, 47.0, 51.0))
+            raw_bis = filtered_bis
             raw_map = filtered.raw_map
             filtered_map = filtered.filtered_map
             raw_hr = filtered.raw_hr
@@ -335,7 +364,9 @@ class SurgicalSuiteInstance:
                 # Filter strictly protects patient by holding safe baseline (no drug dump!)
                 filtered_bis = 48.0
                 if self.injected_artifact_duration <= 0.0:
-                    self.add_event_log("✓ SENSOR RELEASED", "Electrocautery deactivated. Clean EEG tracking restored (SQI 98%). Patient protected from overdose.", "success")
+                    self.add_event_log("✓ RECOVERED", "Electrocautery (Bovie) deactivated: Sensor-Hold disengaged; clean EEG tracking restored (SQI 98%). Zero drug dumping verified.", "success")
+                    if self.active_challenge and self.active_challenge.get("type") == "ARTIFACT":
+                        self.active_challenge = None
 
             # Evaluate Closed-Loop Controller
             vitals_obj = type("VitalsObj", (), {
@@ -358,12 +389,21 @@ class SurgicalSuiteInstance:
                 safe_action[2] = min(safe_action[2], preload_eval.max_allowable_norepi_rate)
 
             # MAP Crash Recovery Dynamics:
+            if self.map_crash_duration > 0.0:
+                self.map_crash_duration -= dt
             if filtered_map < 65.0:
                 # Interlock escalates Norepinephrine infusion to restore arterial tone
-                safe_action[2] = max(float(safe_action[2]), 0.08 + 0.005 * (65.0 - filtered_map))
+                safe_action[2] = max(float(safe_action[2]), 0.09 + 0.006 * (65.0 - filtered_map))
             elif filtered_map >= 70.0 and self.engine.simulator.hemodynamics.params.baseline_map < 90.0:
                 # Smoothly restore baseline MAP after crash is neutralized
-                self.engine.simulator.hemodynamics.params.baseline_map = min(90.0, self.engine.simulator.hemodynamics.params.baseline_map + 0.4)
+                self.engine.simulator.hemodynamics.params.baseline_map = min(90.0, self.engine.simulator.hemodynamics.params.baseline_map + 0.8)
+
+            # Lightening Depth Recovery Dynamics:
+            if self.lightening_duration > 0.0:
+                self.lightening_duration -= dt
+                # Boost Propofol titration while lightening is actively resolving
+                if filtered_bis > 54.0:
+                    safe_action[0] = max(float(safe_action[0]), 6.2 + 0.04 * (filtered_bis - 54.0))
 
             self.latest_action = safe_action
             badge = "[STAGE 2: MAINTENANCE — SURGERY IN PROGRESS]"
@@ -371,14 +411,29 @@ class SurgicalSuiteInstance:
             is_patient_asleep = True
             is_safe_for_surgery = False
 
-            # Challenge Auto-Recovery Evaluation
+            # Challenge Auto-Recovery Evaluation (With Dwell to Prevent Instant Recovery)
             if self.active_challenge and self.active_challenge.get("status") == "RECOVERING":
-                if 40.0 <= filtered_bis <= 60.0 and 68.0 <= filtered_map <= 95.0 and self.injected_artifact_duration <= 0.0:
-                    self.active_challenge["status"] = "AUTO_RECOVERED"
-                    rec_text = f"Vitals stabilized in therapeutic target: BIS {filtered_bis:.0f}, MAP {filtered_map:.0f} mmHg."
-                    self.active_challenge["recovery_text"] = rec_text
-                    self.add_event_log("✓ AUTO-RECOVERED", f"{self.active_challenge['title']} neutralized. {rec_text}", "success")
-                    self.challenge_history.append(dict(self.active_challenge))
+                c_type = self.active_challenge.get("type")
+                min_ticks = self.active_challenge.get("min_ticks", 0)
+                if min_ticks > 0:
+                    self.active_challenge["min_ticks"] = min_ticks - 1
+                else:
+                    recovered = False
+                    rec_log = ""
+                    if c_type == "PAIN" and self.surgical_stimulus <= 0.05 and 44.0 <= filtered_bis <= 56.0 and 70.0 <= filtered_map <= 88.0:
+                        recovered = True
+                        rec_log = f"Incision Surge neutralized: Sympathetic nociception blunted via Remifentanil. Vitals stabilized (MAP {filtered_map:.0f} mmHg, BIS {filtered_bis:.0f})."
+                    elif c_type == "HYPOTENSION" and self.map_crash_duration <= 0.0 and filtered_map >= 71.0:
+                        recovered = True
+                        rec_log = f"Acute MAP Crash resolved: Conformal Lookahead pressor escalation restored arterial pressure (MAP {filtered_map:.0f} mmHg)."
+                    elif c_type == "LIGHTENING" and self.lightening_duration <= 0.0 and filtered_bis <= 53.0:
+                        recovered = True
+                        rec_log = f"Anesthetic Lightening neutralized: Closed-loop Propofol titration restored therapeutic hypnotic depth (BIS {filtered_bis:.0f})."
+
+                    if recovered:
+                        self.add_event_log("✓ RECOVERED", rec_log, "success")
+                        self.challenge_history.append(dict(self.active_challenge))
+                        self.active_challenge = None
 
         # =====================================================================
         # 5. SURGERY COMPLETED: Incision closed, waiting for Emergence
@@ -416,10 +471,15 @@ class SurgicalSuiteInstance:
             safe_action = np.array([0.0, 0.0, 0.0], dtype=np.float32)
             self.latest_action = safe_action
 
-            # Realistic, smooth pharmacokinetic clearance across 120-second countdown
-            r = min(1.0, self.emergence_duration_sec / 110.0)
-            new_ce_prop = max(0.35, 2.2 * (1.0 - 0.78 * r))
-            new_ce_remi = max(0.08, 1.5 * (1.0 - 0.90 * r))
+            # Patient-specific pharmacokinetic clearance across context-sensitive washout duration
+            washout_target = getattr(self, "patient_washout_sec", 110.0)
+            r = min(1.0, self.emergence_duration_sec / washout_target)
+            
+            start_prop = getattr(self, "end_ce_prop", 2.2)
+            start_remi = getattr(self, "end_ce_remi", 1.5)
+
+            new_ce_prop = max(0.35, start_prop * (1.0 - 0.78 * r))
+            new_ce_remi = max(0.08, start_remi * (1.0 - 0.90 * r))
             
             self.engine.simulator.pk_prop.state[3] = new_ce_prop
             self.engine.simulator.pk_remi.state[3] = new_ce_remi
@@ -448,16 +508,17 @@ class SurgicalSuiteInstance:
                 if not self.is_patient_awake:
                     self.is_patient_awake = True
                     self.time_to_wakeup_sec = self.emergence_duration_sec
-                    self.add_event_log("✓ PATIENT AWAKE", f"Consciousness regained (BIS {filtered_bis:.0f}, Prop Ce {prop_ce:.2f} µg/mL). Extubation criteria satisfied at post-op +{self._format_time(self.time_to_wakeup_sec)}.", "success")
+                    t_str = self._format_time(self.time_to_wakeup_sec)
+                    self.add_event_log("✓ PATIENT AWAKE", f"Consciousness regained (Wakeup Time: {t_str}, Age {self.patient.age_years}). BIS {filtered_bis:.0f}, Prop Ce {prop_ce:.2f} µg/mL. Safe for extubation & PACU transfer.", "success")
                 self.clinical_phase = "PACU_TRANSFER"
                 badge = "[✓ PATIENT AWAKE & CONSCIOUS — READY FOR PACU TRANSFER]"
-                readiness_text = f"PATIENT IS AWAKE (BIS {filtered_bis:.0f}, Prop Ce {prop_ce:.2f} µg/mL). Extubation criteria met at post-op +{self._format_time(self.time_to_wakeup_sec)}."
+                readiness_text = f"PATIENT IS AWAKE (Wakeup Time: {self._format_time(self.time_to_wakeup_sec)}, Age {self.patient.age_years}). Extubation criteria met at post-op +{self._format_time(self.time_to_wakeup_sec)}."
                 is_patient_asleep = False
                 is_safe_for_surgery = False
             else:
                 rem_countdown = max(0.0, self.target_emergence_duration - self.emergence_duration_sec)
                 badge = f"[EMERGENCE WASHOUT — COUNTDOWN: {self._format_time(rem_countdown)} | BIS {filtered_bis:.0f}]"
-                readiness_text = f"Emergence in progress: Anesthetic washout active. Drug values clearing (Prop Ce: {prop_ce:.2f} µg/mL), BIS rising..."
+                readiness_text = f"Emergence in progress ({self.patient.age_years}yo patient): Prop Ce clearing ({prop_ce:.2f} µg/mL), BIS rising..."
                 is_patient_asleep = True
                 is_safe_for_surgery = False
 
@@ -569,7 +630,7 @@ class SurgicalSuiteInstance:
                 "active": self.active_challenge,
                 "recent_history": self.challenge_history[-3:] if self.challenge_history else []
             },
-            "event_log": self.event_log[-25:],
+            "event_log": self.event_log[-60:],
             "recent_history": {
                 "bis": list(self.bis_history),
                 "map": list(self.map_history),
@@ -692,7 +753,28 @@ def create_app() -> FastAPI:
             suite.is_patient_awake = False
             suite.time_to_wakeup_sec = None
             suite.latest_action = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-            suite.add_event_log("▶ EMERGENCE", "Anesthetic infusions stopped (0.00). 2-minute emergence countdown started. Washout active.", "warning")
+
+            # Record baseline drug concentrations at conclusion of surgery
+            suite.end_ce_prop = max(1.8, float(suite.engine.simulator.pk_prop.Ce))
+            suite.end_ce_remi = max(0.8, float(suite.engine.simulator.pk_remi.Ce))
+
+            # Realistic Hughes Context-Sensitive PK Emergence Model:
+            # 1. Patient Age Factor: Young (35y) -> 0.78x; Middle (48y) -> 1.05x; Elderly (62y) -> 1.42x
+            age_factor = 0.60 + (suite.patient.age_years / 100.0) ** 1.35
+            
+            # 2. Surgical Duration Factor: Longer procedure -> deeper peripheral tissue saturation
+            surg_min = max(0.5, suite.surgery_duration_sec / 60.0)
+            duration_factor = 0.88 + 0.14 * min(2.5, (surg_min / 2.5) ** 0.5)
+
+            # 3. End-of-case drug loading factor:
+            dose_factor = max(0.88, min(1.30, suite.end_ce_prop / 2.2))
+
+            # Room-specific pharmacokinetic clearance half-time (washout duration)
+            suite.patient_washout_sec = 110.0 * age_factor * duration_factor * dose_factor
+            suite.target_emergence_duration = round(suite.patient_washout_sec, 0)
+            wake_est_str = suite._format_time(suite.patient_washout_sec * 0.65)
+
+            suite.add_event_log("▶ EMERGENCE", f"Anesthetic infusions halted (0.00). PK washout active for {suite.patient.age_years}yo patient (Est. Awakening: ~{wake_est_str}).", "warning")
 
         elif action == "reset_standby":
             suite.clinical_phase = "STANDBY"
@@ -710,10 +792,14 @@ def create_app() -> FastAPI:
             suite.time_to_wakeup_sec = None
             suite.dwell_counter_sec = 0.0
             suite.active_challenge = None
+            suite.map_crash_duration = 0.0
+            suite.lightening_duration = 0.0
+            suite.injected_artifact_duration = 0.0
+            suite.preload_deficit_active = False
             suite.event_log = [{"time": "00:00:00", "tag": "RESET", "text": "Suite reset to clean pre-op standby.", "type": "info"}]
 
         # -------------------------------------------------------------
-        # 2. Intraoperative Challenges & Countermeasures
+        # 2. Intraoperative Challenges & Countermeasures (Multi-click supported)
         # -------------------------------------------------------------
         elif action == "pain":
             val = float(payload.get("value", 0.85))
@@ -722,44 +808,46 @@ def create_app() -> FastAPI:
                 "type": "PAIN",
                 "title": f"⚡ Incision Surge (+{val:.2f} Pain)",
                 "action_taken": "Opioid infusion escalated (+0.18 µg/kg/min) to blunt sympathetic nociception.",
-                "status": "RECOVERING"
+                "status": "RECOVERING",
+                "min_ticks": 6
             }
             suite.add_event_log("⚡ INCISION SURGE", f"Noxious surgical stimulation injected (+{val:.2f}). Sympathetic surge blunted via Remifentanil escalation.", "danger")
 
         elif action == "hypotension":
             val = float(payload.get("value", 25.0))
-            # Directly adjust state variables to produce sudden MAP drop
-            suite.engine.simulator.hemodynamics.current_map = max(42.0, suite.engine.simulator.hemodynamics.current_map - val)
-            suite.engine.simulator.hemodynamics.params.baseline_map = max(55.0, suite.engine.simulator.hemodynamics.params.baseline_map - 18.0)
+            # Immediate acute plunge in MAP
+            suite.engine.simulator.hemodynamics.current_map = max(45.0, suite.engine.simulator.hemodynamics.current_map - val)
+            suite.engine.simulator.hemodynamics.params.baseline_map = 62.0
+            suite.map_crash_duration = 14.0  # 7 seconds of sustained hypotension challenge
             suite.active_challenge = {
                 "type": "HYPOTENSION",
                 "title": f"📉 Acute MAP Crash (-{val:.0f} mmHg)",
                 "action_taken": "Conformal Lookahead engaged -> HOCBF QP escalated Norepinephrine pressor.",
-                "status": "RECOVERING"
+                "status": "RECOVERING",
+                "min_ticks": 6
             }
             suite.add_event_log("📉 MAP CRASH", f"Sudden MAP plunge to {suite.engine.simulator.hemodynamics.current_map:.0f} mmHg (-{val:.0f} mmHg). Proactive pressor engaged.", "danger")
 
         elif action == "preload_deficit":
-            suite.ppv_bias = 7.0
+            suite.ppv_bias = 8.0
+            suite.preload_deficit_active = True
             suite.active_challenge = {
                 "type": "PRELOAD",
-                "title": "💧 Acute Hypovolemia / Preload Deficit (PPV 16%)",
+                "title": "💧 Acute Hypovolemia / Preload Deficit (PPV 16.5%)",
                 "action_taken": "Preload Gate clamped vasopressor & advised 250mL crystalloid fluid bolus.",
-                "status": "RECOVERING"
+                "status": "RECOVERING",
+                "min_ticks": 4
             }
-            suite.add_event_log("💧 PRELOAD DEFICIT", "Stroke volume variation widened (PPV 16%). Vasopressor clamped. 250mL fluid bolus advised.", "warning")
+            suite.add_event_log("💧 PRELOAD DEFICIT", "Stroke volume variation widened (PPV 16.5%). Vasopressor clamped. 250mL fluid bolus advised.", "warning")
 
         elif action == "bolus":
-            suite.ppv_bias = max(0.0, suite.ppv_bias - 7.0)
-            suite.engine.simulator.hemodynamics.current_map = min(92.0, suite.engine.simulator.hemodynamics.current_map + 15.0)
-            suite.engine.simulator.hemodynamics.params.baseline_map = min(90.0, suite.engine.simulator.hemodynamics.params.baseline_map + 10.0)
-            suite.active_challenge = {
-                "type": "BOLUS",
-                "title": "💧 250mL Crystalloid Bolus Delivered",
-                "action_taken": "Intravascular filling restored (PPV normalized < 12%).",
-                "status": "AUTO_RECOVERED"
-            }
-            suite.add_event_log("💧 FLUID BOLUS", "250mL crystalloid fluid bolus delivered. Normovolemia restored (PPV normalized).", "success")
+            suite.ppv_bias = 0.0
+            suite.preload_deficit_active = False
+            suite.engine.simulator.hemodynamics.current_map = min(92.0, suite.engine.simulator.hemodynamics.current_map + 14.0)
+            suite.engine.simulator.hemodynamics.params.baseline_map = 90.0
+            suite.add_event_log("💧 FLUID BOLUS", "250mL crystalloid fluid bolus delivered. Normovolemia restored (PPV normalized to 8.4%).", "success")
+            suite.add_event_log("✓ RECOVERED", "Preload Deficit resolved: Intravascular volume restored by crystalloid bolus.", "success")
+            suite.active_challenge = None
 
         elif action == "artifact":
             dur = float(payload.get("duration", 6.0))
@@ -768,23 +856,35 @@ def create_app() -> FastAPI:
                 "type": "ARTIFACT",
                 "title": f"📻 Electrocautery Interference (Bovie {dur:.0f}s)",
                 "action_taken": "Signal Filter velocity gate engaged -> Sensor-Hold locked (Zero drug dumping).",
-                "status": "RECOVERING"
+                "status": "RECOVERING",
+                "min_ticks": int(dur * 2)
             }
             suite.add_event_log("📻 BOVIE DIATHERMY", f"High-frequency surgical cautery interference ({dur:.0f}s). SQI dropped to 16%, raw BIS spike to 98. Sensor-hold locked.", "warning")
 
         elif action == "lightening":
-            # Shift central mass and effect-site concentration to trigger genuine depth slip
-            suite.engine.simulator.pk_prop.state[3] = 1.05
-            suite.engine.simulator.pk_prop.state[0] = 5.0
-            suite.engine.simulator.pk_remi.state[3] = 0.45
-            suite.engine.simulator.pk_remi.state[0] = 2.0
+            # Genuine anesthetic depth slip: shift PK central and effect compartments
+            suite.engine.simulator.pk_prop.state[3] = 1.65
+            suite.engine.simulator.pk_prop.state[0] = 26.0
+            suite.engine.simulator.pk_remi.state[3] = 0.75
+            suite.engine.simulator.pk_remi.state[0] = 3.5
+            
+            # Align signal filter so velocity gate accepts physiological lightening rather than rejecting as electrical noise
+            target_slip_bis = 71.5
+            suite.engine.signal_filter.last_valid_bis = target_slip_bis
+            suite.engine.signal_filter.bis_buffer.clear()
+            suite.engine.signal_filter.bis_buffer.extend([target_slip_bis] * 6)
+            suite.engine.signal_filter.consecutive_noise_sec = 0.0
+            suite.engine.signal_filter.sensor_hold_active = False
+            
+            suite.lightening_duration = 16.0  # active lightening duration for recovery evaluation
             suite.active_challenge = {
                 "type": "LIGHTENING",
                 "title": "⚠️ Anesthetic Lightening / Depth Slip (+25 BIS)",
-                "action_taken": "Closed-loop detected BIS drift (71.0) -> Propofol pump rate escalated.",
-                "status": "RECOVERING"
+                "action_taken": "Closed-loop detected BIS drift (71.5) -> Propofol pump rate escalated.",
+                "status": "RECOVERING",
+                "min_ticks": 6
             }
-            suite.add_event_log("⚠️ DEPTH LIGHTENING", "Hypnotic depth slipping (BIS jumped to 71). Closed-loop co-pilot escalating Propofol infusion rate.", "danger")
+            suite.add_event_log("⚠️ DEPTH LIGHTENING", "Hypnotic depth slipping (BIS jumped to 71.5). Closed-loop co-pilot escalating Propofol infusion rate.", "danger")
 
         elif action == "mode":
             new_mode = payload.get("mode")
@@ -1963,17 +2063,24 @@ HTML_DASHBOARD_TEMPLATE = """
             // 6. Chronological Intraoperative Event History Log
             const logContainer = document.getElementById('event-log-container');
             if (data.event_log && logContainer) {
-                let html = '';
-                data.event_log.forEach(entry => {
-                    const cls = `log-entry log-entry-${entry.type || 'info'}`;
-                    html += `<div class="${cls}">
-                        <span class="log-time">[${entry.time}]</span>
-                        <span class="log-tag">[${entry.tag}]</span>
-                        <span>${entry.text}</span>
-                    </div>`;
-                });
-                logContainer.innerHTML = html;
-                logContainer.scrollTop = logContainer.scrollHeight;
+                const logKey = JSON.stringify(data.event_log.map(e => e.time + e.tag));
+                if (logContainer.dataset.lastLogKey !== logKey) {
+                    logContainer.dataset.lastLogKey = logKey;
+                    const isNearBottom = (logContainer.scrollHeight - logContainer.scrollTop - logContainer.clientHeight) < 45;
+                    let html = '';
+                    data.event_log.forEach(entry => {
+                        const cls = `log-entry log-entry-${entry.type || 'info'}`;
+                        html += `<div class="${cls}">
+                            <span class="log-time">[${entry.time}]</span>
+                            <span class="log-tag">[${entry.tag}]</span>
+                            <span>${entry.text}</span>
+                        </div>`;
+                    });
+                    logContainer.innerHTML = html;
+                    if (isNearBottom) {
+                        logContainer.scrollTop = logContainer.scrollHeight;
+                    }
+                }
             }
 
             // 7. Vitals Numerics
