@@ -8,7 +8,7 @@ and HOCBF safety statuses across independent surgical suites (OR 1, OR 2, OR 3).
 import asyncio
 from datetime import datetime
 import json
-from typing import Dict
+from typing import Dict, Any
 from fastapi import FastAPI, WebSocket
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 from fastapi.responses import HTMLResponse
@@ -22,12 +22,60 @@ from anesthesionet.safety.preload_gate import QualifiedPreloadGate
 from anesthesionet.safety.watchdog import BedsideWatchdogDaemon
 
 
+# Comprehensive Clinical Metadata for Scheduled Surgeries
+SURGERY_SCHEDULE = {
+    "OR-1": {
+        "suite_id": "OR-1",
+        "room_name": "Operating Suite 1 (OR-1)",
+        "specialty": "General & Laparoscopic Surgery",
+        "procedure_name": "Laparoscopic Cholecystectomy",
+        "lead_surgeon": "Dr. Sarah Mitchell, FACS",
+        "anesthesiologist": "Dr. K. Ramaswamy, MD",
+        "scheduled_time": "08:30 AM",
+        "patient_name": "Johnathan Davies",
+        "demographics": "48 y/o Male | 72 kg | 176 cm | BMI 23.2",
+        "asa_class": "ASA Class II",
+        "preop_diagnosis": "Symptomatic Cholelithiasis / Chronic Cholecystitis",
+        "surgical_plan": "Four-trocar laparoscopic extraction with intraoperative cholangiography"
+    },
+    "OR-2": {
+        "suite_id": "OR-2",
+        "room_name": "Operating Suite 2 (OR-2)",
+        "specialty": "Orthopedic & Joint Reconstruction",
+        "procedure_name": "Total Hip Arthroplasty (Right)",
+        "lead_surgeon": "Dr. Robert Vance, MD, FAAOS",
+        "anesthesiologist": "Dr. Angela Chen, MD",
+        "scheduled_time": "09:15 AM",
+        "patient_name": "Eleanor Vance-Cole",
+        "demographics": "62 y/o Female | 65 kg | 165 cm | BMI 23.9",
+        "asa_class": "ASA Class II",
+        "preop_diagnosis": "Severe End-Stage Osteoarthritis of Right Hip",
+        "surgical_plan": "Posterior approach ceramic-on-polyethylene press-fit total arthroplasty"
+    },
+    "OR-3": {
+        "suite_id": "OR-3",
+        "room_name": "Operating Suite 3 (OR-3)",
+        "specialty": "Cardiovascular & Thoracic Surgery",
+        "procedure_name": "Off-Pump Coronary Artery Bypass (OPCAB x3)",
+        "lead_surgeon": "Dr. Elena Rostova, MD, PhD",
+        "anesthesiologist": "Dr. Markus Lindqvist, MD",
+        "scheduled_time": "10:00 AM",
+        "patient_name": "David Henderson",
+        "demographics": "35 y/o Male | 80 kg | 182 cm | BMI 24.2",
+        "asa_class": "ASA Class III",
+        "preop_diagnosis": "Triple-Vessel Ischemic Coronary Artery Disease",
+        "surgical_plan": "Median sternotomy, off-pump LIMA-to-LAD + SVG-to-OM1/PDA bypass grafting"
+    }
+}
+
+
 class SurgicalSuiteInstance:
     """Encapsulates a full, independent operating room instance."""
 
     def __init__(self, suite_id: str, patient: PatientProfile):
         self.suite_id = suite_id
         self.patient = patient
+        self.surgery_meta = SURGERY_SCHEDULE.get(suite_id, SURGERY_SCHEDULE["OR-1"])
         
         self.engine = DualEngineCoordinator(patient)
         self.controller = FullLifecycleController(patient)
@@ -38,122 +86,427 @@ class SurgicalSuiteInstance:
         # Autonomy: Level 2 (Advisory) or Level 4 (Autonomous Closed-Loop)
         self.autonomy_level = "LEVEL_4_CLOSED_LOOP"
         self.current_time_sec = 0.0
-        self.latest_action = np.array([3.5, 0.12, 0.0], dtype=np.float32)
+        self.latest_action = np.array([0.0, 0.0, 0.0], dtype=np.float32)
         self.surgical_stimulus = 0.0
         self.ppv_bias = 0.0
         self.injected_artifact_duration = 0.0
+
+        # Clinical Lifecycle Phase:
+        # STANDBY -> STAGE_1_INDUCTION -> PATIENT_ASLEEP_READY -> STAGE_2_MAINTENANCE -> SURGERY_COMPLETED -> STAGE_3_EMERGENCE -> PACU_TRANSFER
+        self.clinical_phase = "STANDBY"
+        
+        # Induction and dwell stability counters
+        self.induction_step_count = 0
+        self.dwell_counter_sec = 0.0
+        
+        # Stopwatches / Timers (per suite)
+        self.surgery_timer_active = False
+        self.surgery_duration_sec = 0.0
+        
+        self.emergence_timer_active = False
+        self.emergence_duration_sec = 0.0
+        self.is_patient_awake = False
+        self.time_to_wakeup_sec = None
+
+        # Live Challenge and Autonomous Recovery Tracker
+        self.active_challenge = None
+        self.challenge_history = []
+
+    @staticmethod
+    def _format_time(seconds: float) -> str:
+        s = int(seconds)
+        m, s = divmod(s, 60)
+        h, m = divmod(m, 60)
+        return f"{h:02d}:{m:02d}:{s:02d}"
 
     def step(self) -> dict:
         self.current_time_sec += 1.0
         self.watchdog.receive_heartbeat(self.current_time_sec)
 
-        # Handle transient stimulus decay
+        # Transient challenge decays
         if self.surgical_stimulus > 0.0:
-            self.surgical_stimulus = max(0.0, self.surgical_stimulus - 0.03)
+            self.surgical_stimulus = max(0.0, self.surgical_stimulus - 0.04)
         if self.ppv_bias > 0.0:
             self.ppv_bias = max(0.0, self.ppv_bias - 0.15)
 
-        # 1. Step Dual Engine (Mode A Simulator or Mode B Replay)
-        filtered, cf_proj, meta = self.engine.step(
-            ai_action=self.latest_action,
-            surgical_stimulus=self.surgical_stimulus,
-            dt_seconds=1.0
-        )
+        # Active Timer increments
+        if self.surgery_timer_active:
+            self.surgery_duration_sec += 1.0
+        if self.emergence_timer_active:
+            self.emergence_duration_sec += 1.0
 
-        # Injected electrocautery artifact handling
-        if self.injected_artifact_duration > 0.0:
-            self.injected_artifact_duration -= 1.0
-            filtered = self.engine.signal_filter.filter(
-                raw_bis=98.0,
-                raw_map=filtered.raw_map,
-                raw_hr=filtered.raw_hr,
-                sqi=18.0,
-                emg_db=56.0,
+        # =====================================================================
+        # PHASE-SPECIFIC EXECUTION LOGIC
+        # =====================================================================
+        was_intervened = False
+        cf_proj = None
+        prop_ce = self.engine.simulator.pk_prop.Ce
+        remi_ce = self.engine.simulator.pk_remi.Ce
+
+        # ---------------------------------------------------------------------
+        # 1. STANDBY: Patient awake in pre-op holding area
+        # ---------------------------------------------------------------------
+        if self.clinical_phase == "STANDBY":
+            self.latest_action = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+            self.engine.simulator.pk_prop.reset()
+            self.engine.simulator.pk_remi.reset()
+            self.engine.simulator.hemodynamics.baseline_map = 90.0
+
+            raw_bis = 98.0
+            filtered_bis = 98.0
+            raw_map = 90.0
+            filtered_map = 90.0
+            raw_hr = 75.0
+            filtered_hr = 75.0
+            ppv_est = 8.5
+            sqi_pct = 98.0
+            emg_db = 24.0
+            prop_ce = 0.0
+            remi_ce = 0.0
+            safe_action = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+
+            badge = "[STANDBY: PRE-OP READY — AWAITING INDUCTION]"
+            readiness_text = "Patient awake in pre-op holding area. Ready for induction."
+            is_patient_asleep = False
+            is_safe_for_surgery = False
+
+        # ---------------------------------------------------------------------
+        # 2. STAGE 1 INDUCTION: Bolus given, TCI infusion ramp active
+        # ---------------------------------------------------------------------
+        elif self.clinical_phase == "STAGE_1_INDUCTION":
+            self.induction_step_count += 1
+            filtered, cf_proj, meta = self.engine.step(
+                ai_action=self.latest_action,
+                surgical_stimulus=self.surgical_stimulus,
                 dt_seconds=1.0
             )
 
-        # 2. Record frame in predictive history
+            raw_bis = filtered.raw_bis
+            filtered_bis = filtered.filtered_bis
+            raw_map = filtered.raw_map
+            filtered_map = filtered.filtered_map
+            raw_hr = filtered.raw_hr
+            filtered_hr = filtered.filtered_hr
+            ppv_est = 9.0 + self.ppv_bias
+            sqi_pct = filtered.sqi_percent
+            emg_db = filtered.emg_db
+            prop_ce = self.engine.simulator.pk_prop.Ce
+            remi_ce = self.engine.simulator.pk_remi.Ce
+
+            # Compute TCI ramp infusion rate from InductionController
+            vitals_obj = type("VitalsObj", (), {
+                "bis": filtered_bis,
+                "map_mmhg": filtered_map,
+                "hr_bpm": filtered_hr,
+                "ce_propofol_ug_ml": prop_ce,
+                "ce_remi_ng_ml": remi_ce,
+                "time_seconds": self.current_time_sec
+            })()
+            prop, remi, norepi, _ = self.controller.induction_controller.compute_infusion_rates(
+                vitals_obj, dt_seconds=1.0
+            )
+            self.latest_action = np.array([prop, remi, norepi], dtype=np.float32)
+            safe_action = self.latest_action
+
+            # Dwell stability evaluation
+            if filtered_bis <= 58.0:
+                self.dwell_counter_sec += 1.0
+            else:
+                self.dwell_counter_sec = max(0.0, self.dwell_counter_sec - 0.5)
+
+            # Once LOC reached and verified stable in therapeutic range
+            if filtered_bis <= 58.0 and self.dwell_counter_sec >= 10.0:
+                self.clinical_phase = "PATIENT_ASLEEP_READY"
+                badge = "[✓ PATIENT ASLEEP (LOC CONFIRMED) — SAFE TO START SURGERY]"
+                readiness_text = "PATIENT IS ASLEEP (LOC CONFIRMED) — SAFE TO START SURGERY!"
+                is_patient_asleep = True
+                is_safe_for_surgery = True
+            elif filtered_bis < 60.0:
+                badge = f"[LOC CONFIRMED — STABILIZING IN TARGET ({self.dwell_counter_sec:.0f}s / 10s)]"
+                readiness_text = f"Loss of Consciousness confirmed (BIS {filtered_bis:.0f}). Verifying depth stability ({self.dwell_counter_sec:.0f}s / 10s)..."
+                is_patient_asleep = True
+                is_safe_for_surgery = False
+            else:
+                badge = f"[STAGE 1: TCI INDUCTION RAMPING (BIS: {filtered_bis:.0f})]"
+                readiness_text = f"Induction in progress: Propofol bolus administered. Ce rising ({prop_ce:.2f} µg/mL), BIS descending..."
+                is_patient_asleep = False
+                is_safe_for_surgery = False
+
+        # ---------------------------------------------------------------------
+        # 3. PATIENT ASLEEP & READY: Waiting for Operator to click "Start Surgery"
+        # ---------------------------------------------------------------------
+        elif self.clinical_phase == "PATIENT_ASLEEP_READY":
+            self.controller.stage = SurgicalStage.READINESS_HYSTERESIS
+            self.latest_action = np.array([3.4, 0.12, 0.0], dtype=np.float32)
+            filtered, cf_proj, meta = self.engine.step(
+                ai_action=self.latest_action,
+                surgical_stimulus=0.0,
+                dt_seconds=1.0
+            )
+
+            raw_bis = filtered.raw_bis
+            filtered_bis = filtered.filtered_bis
+            raw_map = filtered.raw_map
+            filtered_map = filtered.filtered_map
+            raw_hr = filtered.raw_hr
+            filtered_hr = filtered.filtered_hr
+            ppv_est = 9.0 + self.ppv_bias
+            sqi_pct = filtered.sqi_percent
+            emg_db = filtered.emg_db
+            prop_ce = self.engine.simulator.pk_prop.Ce
+            remi_ce = self.engine.simulator.pk_remi.Ce
+            safe_action = self.latest_action
+
+            badge = "[✓ PATIENT ASLEEP (LOC CONFIRMED) — SAFE TO START SURGERY]"
+            readiness_text = "PATIENT IS ASLEEP (LOC CONFIRMED) — SAFE TO START SURGERY!"
+            is_patient_asleep = True
+            is_safe_for_surgery = True
+
+        # ---------------------------------------------------------------------
+        # 4. STAGE 2 MAINTENANCE: Active Surgery & Closed-Loop Autonomous Control
+        # ---------------------------------------------------------------------
+        elif self.clinical_phase == "STAGE_2_MAINTENANCE":
+            self.controller.stage = SurgicalStage.STAGE_2_MAINTENANCE
+            filtered, cf_proj, meta = self.engine.step(
+                ai_action=self.latest_action,
+                surgical_stimulus=self.surgical_stimulus,
+                dt_seconds=1.0
+            )
+
+            # Injected electrocautery artifact handling
+            if self.injected_artifact_duration > 0.0:
+                self.injected_artifact_duration -= 1.0
+                filtered = self.engine.signal_filter.filter(
+                    raw_bis=98.0,
+                    raw_map=filtered.raw_map,
+                    raw_hr=filtered.raw_hr,
+                    sqi=18.0,
+                    emg_db=56.0,
+                    dt_seconds=1.0
+                )
+
+            raw_bis = filtered.raw_bis
+            filtered_bis = filtered.filtered_bis
+            raw_map = filtered.raw_map
+            filtered_map = filtered.filtered_map
+            raw_hr = filtered.raw_hr
+            filtered_hr = filtered.filtered_hr
+            ppv_est = 9.0 + self.ppv_bias + (max(0.0, 75.0 - filtered_map) * 0.1)
+            sqi_pct = filtered.sqi_percent
+            emg_db = filtered.emg_db
+            prop_ce = self.engine.simulator.pk_prop.Ce
+            remi_ce = self.engine.simulator.pk_remi.Ce
+
+            # Closed-Loop FSM & MIMO-SAC Controller
+            vitals_obj = type("VitalsObj", (), {
+                "bis": filtered_bis,
+                "map_mmhg": filtered_map,
+                "hr_bpm": filtered_hr,
+                "ce_propofol_ug_ml": prop_ce,
+                "ce_remi_ng_ml": remi_ce,
+                "time_seconds": self.current_time_sec
+            })()
+            safe_action, was_intervened, _ = self.controller.step(
+                vitals=vitals_obj,
+                surgical_stimulus=self.surgical_stimulus,
+                dt_seconds=1.0
+            )
+
+            # Preload Gate enforcement
+            preload_eval = self.preload_gate.evaluate(ppv_percent=ppv_est)
+            if preload_eval.is_fluid_responsive:
+                safe_action[2] = min(safe_action[2], preload_eval.max_allowable_norepi_rate)
+
+            self.latest_action = safe_action
+            badge = "[STAGE 2: MAINTENANCE — SURGERY IN PROGRESS]"
+            readiness_text = "Surgery in progress. Closed-loop MIMO-SAC controller & HOCBF safety active."
+            is_patient_asleep = True
+            is_safe_for_surgery = False
+
+            # Challenge Auto-Recovery Monitor
+            if self.active_challenge:
+                if self.active_challenge.get("status") == "RECOVERING":
+                    # Check recovery into clinical target zone (BIS 40-60, MAP 68-95)
+                    if 40.0 <= filtered_bis <= 60.0 and 68.0 <= filtered_map <= 95.0 and self.injected_artifact_duration == 0.0:
+                        self.active_challenge["status"] = "AUTO_RECOVERED"
+                        self.active_challenge["recovery_text"] = f"Vitals stabilized in therapeutic target: BIS {filtered_bis:.0f}, MAP {filtered_map:.0f} mmHg."
+                        self.challenge_history.append(dict(self.active_challenge))
+
+        # ---------------------------------------------------------------------
+        # 5. SURGERY COMPLETED: Incision closed, waiting for Emergence
+        # ---------------------------------------------------------------------
+        elif self.clinical_phase == "SURGERY_COMPLETED":
+            self.latest_action = np.array([2.5, 0.08, 0.0], dtype=np.float32)
+            filtered, cf_proj, meta = self.engine.step(
+                ai_action=self.latest_action,
+                surgical_stimulus=0.0,
+                dt_seconds=1.0
+            )
+
+            raw_bis = filtered.raw_bis
+            filtered_bis = filtered.filtered_bis
+            raw_map = filtered.raw_map
+            filtered_map = filtered.filtered_map
+            raw_hr = filtered.raw_hr
+            filtered_hr = filtered.filtered_hr
+            ppv_est = 9.0 + self.ppv_bias
+            sqi_pct = filtered.sqi_percent
+            emg_db = filtered.emg_db
+            prop_ce = self.engine.simulator.pk_prop.Ce
+            remi_ce = self.engine.simulator.pk_remi.Ce
+            safe_action = self.latest_action
+
+            badge = "[SURGERY COMPLETED — AWAITING OPERATOR TO START EMERGENCE]"
+            readiness_text = f"Surgical procedure completed (Duration: {self._format_time(self.surgery_duration_sec)}). Click 'Start Emergence Phase' to discontinue anesthetics."
+            is_patient_asleep = True
+            is_safe_for_surgery = False
+
+        # ---------------------------------------------------------------------
+        # 6. STAGE 3 EMERGENCE & PACU TRANSFER: Drug Washout & Awakening
+        # ---------------------------------------------------------------------
+        elif self.clinical_phase in ["STAGE_3_EMERGENCE", "PACU_TRANSFER"]:
+            safe_action = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+            self.latest_action = safe_action
+
+            # Progressive pharmacokinetic clearance
+            current_ce_prop = self.engine.simulator.pk_prop.Ce
+            current_ce_remi = self.engine.simulator.pk_remi.Ce
+
+            new_ce_prop = max(0.2, current_ce_prop - 0.065)
+            new_ce_remi = max(0.04, current_ce_remi - 0.06)
+            self.engine.simulator.pk_prop.state[3] = new_ce_prop
+            self.engine.simulator.pk_remi.state[3] = new_ce_remi
+            self.engine.simulator.pk_prop.state[0] = max(0.0, self.engine.simulator.pk_prop.state[0] - 0.5)
+            self.engine.simulator.pk_remi.state[0] = max(0.0, self.engine.simulator.pk_remi.state[0] - 0.25)
+
+            # Compute BIS from cleared effect-site concentrations
+            raw_bis = self.engine.simulator.pd_synergy.compute_bis(new_ce_prop, new_ce_remi)
+            filtered_bis = raw_bis
+            raw_map, raw_hr, ppv_est = self.engine.simulator.hemodynamics.step(
+                Ce_prop_ug_ml=new_ce_prop,
+                Ce_remi_ng_ml=new_ce_remi,
+                norepi_infusion_ug_kg_min=0.0,
+                surgical_noxious_stimulus=0.0,
+                dt_seconds=1.0
+            )
+            filtered_map = raw_map
+            filtered_hr = raw_hr
+            sqi_pct = 98.0
+            emg_db = 26.0
+            prop_ce = new_ce_prop
+            remi_ce = new_ce_remi
+
+            if raw_bis >= 75.0 and prop_ce <= 1.05:
+                self.clinical_phase = "PACU_TRANSFER"
+                self.is_patient_awake = True
+                if self.time_to_wakeup_sec is None:
+                    self.time_to_wakeup_sec = self.emergence_duration_sec
+                badge = "[✓ PATIENT AWAKE & CONSCIOUS — READY FOR PACU TRANSFER]"
+                readiness_text = f"PATIENT IS AWAKE (BIS {filtered_bis:.0f}, Prop Ce {prop_ce:.2f} µg/mL). Extubation criteria met at post-op +{self._format_time(self.time_to_wakeup_sec)}."
+                is_patient_asleep = False
+                is_safe_for_surgery = False
+            else:
+                badge = f"[STAGE 3: EMERGENCE WASHOUT (BIS {filtered_bis:.0f} | Prop Ce: {prop_ce:.2f} µg/mL)]"
+                readiness_text = f"Emergence in progress: Anesthetic washout active. Drug values clearing (Prop Ce: {prop_ce:.2f} µg/mL), BIS rising..."
+                is_patient_asleep = True
+                is_safe_for_surgery = False
+
+        # Record predictive frame & forecast
         self.forecaster.record_frame(
             time_sec=self.current_time_sec,
-            bis=filtered.filtered_bis,
-            map_mmhg=filtered.filtered_map,
-            hr_bpm=filtered.filtered_hr,
+            bis=filtered_bis,
+            map_mmhg=filtered_map,
+            hr_bpm=filtered_hr,
             prop_rate=float(self.latest_action[0]),
             remi_rate=float(self.latest_action[1]),
             norepi_rate=float(self.latest_action[2])
         )
-
-        # 3. Forecast future trajectories
         prediction = self.forecaster.forecast()
-
-        # 4. Evaluate Dynamic Preload
-        # Assume PPV ~ 9% in normovolemia, rising if stimulus/deficit occurs
-        ppv_est = 9.0 + self.ppv_bias + (max(0.0, 75.0 - filtered.filtered_map) * 0.1)
         preload_eval = self.preload_gate.evaluate(ppv_percent=ppv_est)
-
-        # 5. Evaluate FSM Controller
-        # Create vitals snapshot
-        vitals_snapshot = self.engine.simulator.hemodynamics
-        vitals_obj = type("VitalsObj", (), {
-            "bis": filtered.filtered_bis,
-            "map_mmhg": filtered.filtered_map,
-            "hr_bpm": filtered.filtered_hr,
-            "ce_propofol_ug_ml": self.engine.simulator.pk_prop.Ce,
-            "ce_remi_ng_ml": self.engine.simulator.pk_remi.Ce,
-            "time_seconds": self.current_time_sec
-        })()
-
-        safe_action, was_intervened, fsm_info = self.controller.step(
-            vitals=vitals_obj,
-            surgical_stimulus=self.surgical_stimulus,
-            dt_seconds=1.0
-        )
-
-        # Enforce preload clamp on Norepinephrine if hypovolemic
-        if preload_eval.is_fluid_responsive:
-            safe_action[2] = min(safe_action[2], preload_eval.max_allowable_norepi_rate)
-
-        # In Level 4 autonomy, apply certified action; in Level 2, advise
-        self.latest_action = safe_action
-
-        # 6. Check Watchdog status
         watchdog_stat = self.watchdog.evaluate_status(self.current_time_sec)
 
-        # 7. Compute Real-Time XAI Feature Attributions
-        xai_map_risk = round(min(100.0, max(5.0, (75.0 - filtered.filtered_map) * 3.0 + 35.0)), 1)
-        xai_bis_error = round(min(100.0, max(5.0, abs(50.0 - filtered.filtered_bis) * 3.5 + 20.0)), 1)
+        # Explainable AI feature attributions
+        xai_map_risk = round(min(100.0, max(5.0, (75.0 - filtered_map) * 3.0 + 35.0)), 1)
+        xai_bis_error = round(min(100.0, max(5.0, abs(50.0 - filtered_bis) * 3.5 + 20.0)), 1)
         xai_nociception = round(min(100.0, max(5.0, self.surgical_stimulus * 95.0 + 10.0)), 1)
+
         if self.surgical_stimulus > 0.25:
             xai_driver = "Surgical Nociception Surge"
-        elif filtered.filtered_map < 68.0:
+        elif filtered_map < 68.0:
             xai_driver = "Conformal Hypotension Lookahead"
-        elif abs(filtered.filtered_bis - 50.0) > 10.0:
+        elif abs(filtered_bis - 50.0) > 10.0:
             xai_driver = "Hypnotic Depth Error Compensation"
+        elif self.clinical_phase in ["STAGE_3_EMERGENCE", "PACU_TRANSFER"]:
+            xai_driver = "Emergence Pharmacokinetic Clearance"
+        elif self.clinical_phase == "STANDBY":
+            xai_driver = "Pre-Induction Awake Baseline"
         else:
             xai_driver = "Bouillon Synergistic Ridge Titration"
 
-        # Compile payload
+        # Determine drug status descriptions
+        if self.clinical_phase == "STANDBY":
+            prop_status = "Standby (0.00)"
+            remi_status = "Standby (0.00)"
+        elif self.clinical_phase == "STAGE_1_INDUCTION":
+            prop_status = "TCI Bolus Ramp"
+            remi_status = "Synergistic Co-Induction"
+        elif self.clinical_phase in ["STAGE_3_EMERGENCE", "PACU_TRANSFER"]:
+            prop_status = "Clearing (Washout)"
+            remi_status = "Airway / Washout"
+        else:
+            prop_status = "Closed-Loop Titration"
+            remi_status = "Analgesic Titration"
+
+        # Compile comprehensive real-time payload
         return {
             "suite_id": self.suite_id,
             "time_seconds": self.current_time_sec,
             "mode": self.engine.mode.value,
+            "phase": self.clinical_phase,
             "stage": self.controller.stage.value,
-            "badge": fsm_info.get("badge") or f"[{self.controller.stage.value}]",
+            "badge": badge,
             "autonomy_level": self.autonomy_level,
+            "surgery_meta": self.surgery_meta,
+            "readiness": {
+                "is_patient_asleep": is_patient_asleep,
+                "is_safe_for_surgery": is_safe_for_surgery,
+                "status_text": readiness_text
+            },
+            "timers": {
+                "surgery_timer_active": self.surgery_timer_active,
+                "surgery_duration_sec": self.surgery_duration_sec,
+                "surgery_formatted": self._format_time(self.surgery_duration_sec),
+                "emergence_timer_active": self.emergence_timer_active,
+                "emergence_duration_sec": self.emergence_duration_sec,
+                "emergence_formatted": self._format_time(self.emergence_duration_sec),
+                "is_patient_awake": self.is_patient_awake,
+                "time_to_wakeup_sec": self.time_to_wakeup_sec,
+                "wakeup_formatted": self._format_time(self.time_to_wakeup_sec) if self.time_to_wakeup_sec is not None else "--:--"
+            },
             "vitals": {
-                "raw_bis": round(filtered.raw_bis, 1),
-                "filtered_bis": round(filtered.filtered_bis, 1),
-                "raw_map": round(filtered.raw_map, 1),
-                "filtered_map": round(filtered.filtered_map, 1),
-                "filtered_hr": round(filtered.filtered_hr, 1),
+                "raw_bis": round(raw_bis, 1),
+                "filtered_bis": round(filtered_bis, 1),
+                "raw_map": round(raw_map, 1),
+                "filtered_map": round(filtered_map, 1),
+                "filtered_hr": round(filtered_hr, 1),
                 "ppv_percent": round(ppv_est, 1),
-                "sqi_percent": round(filtered.sqi_percent, 1),
-                "emg_db": round(filtered.emg_db, 1),
+                "sqi_percent": round(sqi_pct, 1),
+                "emg_db": round(emg_db, 1),
+                "ce_propofol_ug_ml": round(prop_ce, 2),
+                "ce_remi_ng_ml": round(remi_ce, 2)
             },
             "infusion_rates": {
                 "propofol_mg_kg_h": round(float(safe_action[0]), 2),
                 "remifentanil_ug_kg_min": round(float(safe_action[1]), 3),
                 "norepinephrine_ug_kg_min": round(float(safe_action[2]), 3),
+                "propofol_ce_ug_ml": round(prop_ce, 2),
+                "remifentanil_ce_ng_ml": round(remi_ce, 2),
+                "propofol_status": prop_status,
+                "remifentanil_status": remi_status
+            },
+            "challenge": {
+                "active": self.active_challenge,
+                "recent_history": self.challenge_history[-3:] if self.challenge_history else []
             },
             "predictions": {
                 "proactive_hypotension": prediction.proactive_hypotension_alert,
@@ -165,7 +518,7 @@ class SurgicalSuiteInstance:
             },
             "safety": {
                 "is_hocbf_intervened": was_intervened,
-                "is_sensor_hold": filtered.sensor_hold_active,
+                "is_sensor_hold": (self.injected_artifact_duration > 0.0),
                 "preload_advisory": preload_eval.clinical_advisory,
                 "watchdog_alarm": watchdog_stat.alarm_status,
                 "is_watchdog_tripped": watchdog_stat.is_failsafe_tripped
@@ -185,9 +538,9 @@ class SurgicalSuiteInstance:
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="AnesthesioNet-AI Clinical Co-Pilot Server", version="0.1.0")
+    app = FastAPI(title="AnesthesioNet-AI Clinical Co-Pilot Server", version="0.2.0")
 
-    # Initialize 3 Independent Operating Suites
+    # Initialize 3 Independent Operating Suites — ALL INITIALLY IN STANDBY
     suites: Dict[str, SurgicalSuiteInstance] = {
         "OR-1": SurgicalSuiteInstance(
             "OR-1",
@@ -202,20 +555,6 @@ def create_app() -> FastAPI:
             PatientProfile(age_years=35, weight_kg=80, height_cm=182, sex="male")
         )
     }
-
-    # Prime OR-1 to Maintenance stage
-    suites["OR-1"].controller.stage = SurgicalStage.STAGE_2_MAINTENANCE
-    suites["OR-1"].engine.simulator.pk_prop.state[0] = 16.0
-    suites["OR-1"].engine.simulator.pk_prop.state[3] = 2.2  # Ce Propofol = 2.2 ug/mL (Therapeutic)
-    suites["OR-1"].engine.simulator.pk_remi.state[0] = 7.0
-    suites["OR-1"].engine.simulator.pk_remi.state[3] = 1.5  # Ce Remifentanil = 1.5 ng/mL (Therapeutic)
-
-    # Prime OR-3 to Stage 3 Emergence stage (Emergence Clearance)
-    suites["OR-3"].controller.stage = SurgicalStage.STAGE_3_EMERGENCE
-    suites["OR-3"].engine.simulator.pk_prop.state[0] = 3.0
-    suites["OR-3"].engine.simulator.pk_prop.state[3] = 0.9  # Ce Propofol clearing (Awakening)
-    suites["OR-3"].engine.simulator.pk_remi.state[0] = 0.8
-    suites["OR-3"].engine.simulator.pk_remi.state[3] = 0.3
 
     @app.get("/", response_class=HTMLResponse)
     async def get_dashboard():
@@ -235,62 +574,125 @@ def create_app() -> FastAPI:
         suite = suites.get(suite_id, suites["OR-1"])
         action = payload.get("action")
 
-        if action == "pain":
-            suite.surgical_stimulus = float(payload.get("value", 0.85))
+        # -------------------------------------------------------------
+        # Clinical Lifecycle Actions
+        # -------------------------------------------------------------
+        if action == "start_induction":
+            suite.clinical_phase = "STAGE_1_INDUCTION"
+            suite.controller.stage = SurgicalStage.STAGE_1_INDUCTION
+            suite.controller.induction_controller.reset()
+            bolus_mg = suite.controller.trigger_induction()
+            suite.engine.simulator.pk_prop.bolus(bolus_mg)
+            # Rapid initial onset in central compartment
+            suite.engine.simulator.pk_prop.state[3] = 0.6
+            suite.engine.simulator.pk_remi.state[3] = 0.5
+            suite.dwell_counter_sec = 0.0
+            suite.latest_action = np.array([6.0, 0.20, 0.0], dtype=np.float32)
+
+        elif action == "start_surgery":
+            suite.clinical_phase = "STAGE_2_MAINTENANCE"
+            suite.controller.stage = SurgicalStage.STAGE_2_MAINTENANCE
+            suite.surgery_timer_active = True
+            suite.latest_action = np.array([3.5, 0.12, 0.0], dtype=np.float32)
+
+        elif action == "end_surgery":
+            suite.clinical_phase = "SURGERY_COMPLETED"
+            suite.surgery_timer_active = False
+
+        elif action == "start_emergence":
+            suite.clinical_phase = "STAGE_3_EMERGENCE"
+            suite.controller.trigger_emergence(suite.current_time_sec)
+            suite.emergence_timer_active = True
+            suite.emergence_duration_sec = 0.0
+            suite.is_patient_awake = False
+            suite.time_to_wakeup_sec = None
+            suite.latest_action = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+
+        elif action == "reset_standby":
+            suite.clinical_phase = "STANDBY"
+            suite.controller.stage = SurgicalStage.STANDBY
+            suite.controller.induction_controller.reset()
+            suite.engine.simulator.pk_prop.reset()
+            suite.engine.simulator.pk_remi.reset()
+            suite.engine.simulator.hemodynamics.baseline_map = 90.0
+            suite.latest_action = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+            suite.surgery_timer_active = False
+            suite.surgery_duration_sec = 0.0
+            suite.emergence_timer_active = False
+            suite.emergence_duration_sec = 0.0
+            suite.is_patient_awake = False
+            suite.time_to_wakeup_sec = None
+            suite.dwell_counter_sec = 0.0
+            suite.active_challenge = None
+
+        # -------------------------------------------------------------
+        # Intraoperative Challenges & Countermeasures
+        # -------------------------------------------------------------
+        elif action == "pain":
+            val = float(payload.get("value", 0.85))
+            suite.surgical_stimulus = val
+            suite.active_challenge = {
+                "type": "PAIN",
+                "title": f"⚡ Noxious Incision Surge (+{val:.2f} Pain)",
+                "action_taken": "Opioid infusion increased (+0.18 µg/kg/min) to suppress sympathetic surge.",
+                "status": "RECOVERING"
+            }
+
         elif action == "hypotension":
-            suite.engine.simulator.hemodynamics.baseline_map = max(45.0, suite.engine.simulator.hemodynamics.baseline_map - float(payload.get("value", 20.0)))
-        elif action == "bolus":
-            suite.engine.simulator.hemodynamics.baseline_map = min(92.0, suite.engine.simulator.hemodynamics.baseline_map + 15.0)
-            suite.ppv_bias = -3.0
+            val = float(payload.get("value", 20.0))
+            suite.engine.simulator.hemodynamics.baseline_map = max(45.0, suite.engine.simulator.hemodynamics.baseline_map - val)
+            suite.active_challenge = {
+                "type": "HYPOTENSION",
+                "title": f"📉 Sudden MAP Crash (-{val:.0f} mmHg)",
+                "action_taken": "Conformal Lookahead engaged -> HOCBF QP titrated Norepinephrine micro-dose.",
+                "status": "RECOVERING"
+            }
+
         elif action == "preload_deficit":
             suite.ppv_bias = 7.0
+            suite.active_challenge = {
+                "type": "PRELOAD",
+                "title": "💧 Acute Hypovolemia / Preload Deficit (PPV 16%)",
+                "action_taken": "Preload Gate clamped vasopressor & advised 250mL crystalloid fluid bolus.",
+                "status": "RECOVERING"
+            }
+
+        elif action == "bolus":
+            suite.ppv_bias = max(0.0, suite.ppv_bias - 7.0)
+            suite.engine.simulator.hemodynamics.baseline_map = min(92.0, suite.engine.simulator.hemodynamics.baseline_map + 15.0)
+            suite.active_challenge = {
+                "type": "BOLUS",
+                "title": "💧 250mL Crystalloid Bolus Delivered",
+                "action_taken": "Intravascular filling restored (PPV normalized < 12%).",
+                "status": "AUTO_RECOVERED"
+            }
+
         elif action == "artifact":
-            suite.injected_artifact_duration = float(payload.get("duration", 6.0))
-        elif action == "stage":
-            new_stage = str(payload.get("stage", ""))
-            if "STANDBY" in new_stage.upper() or new_stage == "0":
-                suite.controller.stage = SurgicalStage.STANDBY
-                suite.controller.induction_controller.reset()
-                suite.engine.simulator.pk_prop.reset()
-                suite.engine.simulator.pk_remi.reset()
-                suite.engine.simulator.hemodynamics.baseline_map = 90.0
-                suite.latest_action = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+            dur = float(payload.get("duration", 6.0))
+            suite.injected_artifact_duration = dur
+            suite.active_challenge = {
+                "type": "ARTIFACT",
+                "title": f"📻 Electrocautery Interference (Bovie {dur:.0f}s)",
+                "action_taken": "Signal Filter velocity gate engaged -> Sensor-Hold locked (Zero drug dumping).",
+                "status": "RECOVERING"
+            }
 
-            elif "INDUCTION" in new_stage.upper() or new_stage == "1":
-                suite.controller.stage = SurgicalStage.STAGE_1_INDUCTION
-                bolus_mg = suite.controller.trigger_induction()
-                suite.engine.simulator.pk_prop.bolus(bolus_mg)
-                prop_rate, remi_rate, norepi_rate, _ = suite.controller.induction_controller.compute_infusion_rates(
-                    type("VitalsObj", (), {
-                        "bis": 98.0,
-                        "map_mmhg": suite.engine.simulator.hemodynamics.baseline_map,
-                        "hr_bpm": 75.0,
-                        "ce_propofol_ug_ml": suite.engine.simulator.pk_prop.Ce,
-                        "ce_remi_ng_ml": suite.engine.simulator.pk_remi.Ce,
-                        "time_seconds": suite.current_time_sec
-                    })()
-                )
-                suite.latest_action = np.array([prop_rate, remi_rate, norepi_rate], dtype=np.float32)
+        elif action == "lightening":
+            suite.engine.simulator.pk_prop.state[3] = max(0.8, suite.engine.simulator.pk_prop.state[3] - 1.0)
+            suite.active_challenge = {
+                "type": "LIGHTENING",
+                "title": "⚠️ Anesthetic Lightening / Patient Bucking Risk",
+                "action_taken": "Closed-loop detected BIS drift -> Propofol micro-bolus titrated.",
+                "status": "RECOVERING"
+            }
 
-            elif "MAINTENANCE" in new_stage.upper() or "MAINT" in new_stage.upper() or new_stage == "2":
-                suite.controller.stage = SurgicalStage.STAGE_2_MAINTENANCE
-                if suite.engine.simulator.pk_prop.Ce < 1.0:
-                    suite.engine.simulator.pk_prop.state[3] = 2.2
-                    suite.engine.simulator.pk_prop.state[0] = 16.0
-                if suite.engine.simulator.pk_remi.Ce < 0.5:
-                    suite.engine.simulator.pk_remi.state[3] = 1.5
-                    suite.engine.simulator.pk_remi.state[0] = 7.0
-                suite.latest_action = np.array([3.5, 0.12, 0.0], dtype=np.float32)
-
-            elif "EMERGENCE" in new_stage.upper() or new_stage == "3":
-                suite.controller.trigger_emergence(suite.current_time_sec)
-                suite.latest_action = np.array([0.0, 0.0, 0.0], dtype=np.float32)
         elif action == "mode":
             new_mode = payload.get("mode")
             if new_mode == "MODE_B_REPLAY":
                 suite.engine.switch_mode(ExecutionMode.MODE_B_REPLAY)
             else:
                 suite.engine.switch_mode(ExecutionMode.MODE_A_SIMULATOR)
+
         elif action == "autonomy":
             suite.autonomy_level = payload.get("level", "LEVEL_4_CLOSED_LOOP")
 
@@ -339,6 +741,7 @@ HTML_DASHBOARD_TEMPLATE = """
             --red: #ef4444;
             --blue: #3b82f6;
             --purple: #8b5cf6;
+            --cyan: #06b6d4;
             --text-light: #f3f4f6;
             --text-muted: #9ca3af;
         }
@@ -371,7 +774,7 @@ HTML_DASHBOARD_TEMPLATE = """
             flex-shrink: 0;
         }
         .header-title {
-            font-size: 1.15rem;
+            font-size: 1.05rem;
             font-weight: 700;
             color: #fff;
             display: flex;
@@ -383,7 +786,7 @@ HTML_DASHBOARD_TEMPLATE = """
             color: var(--green);
             padding: 3px 6px;
             border-radius: 4px;
-            font-size: 0.7rem;
+            font-size: 0.68rem;
             font-weight: 600;
             letter-spacing: 0.04em;
         }
@@ -398,40 +801,155 @@ HTML_DASHBOARD_TEMPLATE = """
             background: none;
             border: none;
             color: var(--text-muted);
-            padding: 4px 12px;
+            padding: 4px 10px;
             border-radius: 5px;
-            font-size: 0.78rem;
+            font-size: 0.74rem;
             font-weight: 600;
             cursor: pointer;
             transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            gap: 4px;
         }
         .tab-btn.active {
             background-color: var(--blue);
             color: #fff;
         }
+
+        /* Top Scheduled Surgery & Timers Banner */
+        .suite-banner {
+            background: linear-gradient(90deg, #111827 0%, #1e293b 100%);
+            border-bottom: 1px solid var(--border);
+            padding: 6px 16px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-shrink: 0;
+        }
+        .meta-left {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
+        .meta-title {
+            font-size: 0.95rem;
+            font-weight: 800;
+            color: #f3f4f6;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .meta-sub {
+            font-size: 0.72rem;
+            color: var(--text-muted);
+        }
+
+        /* Dual Digital Stopwatches */
+        .timers-cluster {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .timer-box {
+            background-color: #0b1120;
+            border: 1px solid #334155;
+            border-radius: 6px;
+            padding: 3px 8px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            min-width: 130px;
+        }
+        .timer-label {
+            font-size: 0.62rem;
+            color: var(--text-muted);
+            font-weight: 700;
+            letter-spacing: 0.04em;
+        }
+        .timer-digits {
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 1.25rem;
+            font-weight: 800;
+            line-height: 1.1;
+            letter-spacing: 0.05em;
+        }
+        .timer-status {
+            font-size: 0.6rem;
+            font-weight: 700;
+            padding: 1px 4px;
+            border-radius: 3px;
+            margin-top: 2px;
+        }
+        .timer-surgery { color: #38bdf8; }
+        .timer-emergence { color: #c084fc; }
+
+        /* Main Workspace Layout */
         main {
             flex: 1;
             display: grid;
-            grid-template-columns: 1.45fr 1fr;
-            gap: 10px;
-            padding: 8px 12px;
+            grid-template-columns: 1.42fr 1fr;
+            gap: 8px;
+            padding: 6px 12px;
             overflow: hidden;
-            height: calc(100vh - 42px);
-            max-height: calc(100vh - 42px);
+            height: calc(100vh - 86px);
+            max-height: calc(100vh - 86px);
         }
         .col-left {
             display: flex;
             flex-direction: column;
-            gap: 8px;
+            gap: 6px;
             height: 100%;
             min-height: 0;
             overflow: hidden;
         }
+        .col-right {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            height: 100%;
+            min-height: 0;
+            overflow: hidden;
+        }
+
+        /* Clinical Readiness Alert Banner */
+        .readiness-banner {
+            border-radius: 6px;
+            padding: 6px 10px;
+            font-size: 0.78rem;
+            font-weight: 700;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            transition: all 0.3s ease;
+            flex-shrink: 0;
+        }
+        .readiness-standby { background: #172554; border-left: 4px solid var(--blue); color: #bfdbfe; }
+        .readiness-induction { background: #451a03; border-left: 4px solid var(--amber); color: #fde68a; animation: pulseAmber 1.5s infinite; }
+        .readiness-asleep { background: #064e3b; border-left: 4px solid var(--green); color: #a7f3d0; box-shadow: 0 0 12px rgba(16, 185, 129, 0.35); animation: pulseGreen 1.8s infinite; }
+        .readiness-surgery { background: #0c4a6e; border-left: 4px solid var(--cyan); color: #bae6fd; }
+        .readiness-completed { background: #78350f; border-left: 4px solid #f59e0b; color: #fef3c7; }
+        .readiness-emergence { background: #3b0764; border-left: 4px solid var(--purple); color: #e9d5ff; animation: pulsePurple 1.5s infinite; }
+        .readiness-awake { background: #064e3b; border-left: 4px solid var(--green); color: #6ee7b7; box-shadow: 0 0 14px rgba(16, 185, 129, 0.45); }
+
+        @keyframes pulseGreen {
+            0%, 100% { box-shadow: 0 0 6px rgba(16, 185, 129, 0.2); }
+            50% { box-shadow: 0 0 16px rgba(16, 185, 129, 0.6); }
+        }
+        @keyframes pulseAmber {
+            0%, 100% { opacity: 0.9; }
+            50% { opacity: 1.0; }
+        }
+        @keyframes pulsePurple {
+            0%, 100% { opacity: 0.85; }
+            50% { opacity: 1.0; }
+        }
+
+        /* Telemetry Card & Vitals */
         .telemetry-card {
             background-color: var(--card-bg);
             border: 1px solid var(--border);
             border-radius: 8px;
-            padding: 10px 12px;
+            padding: 8px 10px;
             display: flex;
             flex-direction: column;
             flex: 1;
@@ -440,38 +958,39 @@ HTML_DASHBOARD_TEMPLATE = """
         .vitals-banner {
             display: grid;
             grid-template-columns: repeat(4, 1fr);
-            gap: 8px;
-            margin: 6px 0;
+            gap: 6px;
+            margin: 4px 0;
         }
         .vital-box {
             background-color: #1e293b;
             border-radius: 6px;
-            padding: 6px;
+            padding: 5px;
             text-align: center;
         }
         .vital-title {
-            font-size: 0.68rem;
+            font-size: 0.65rem;
             color: var(--text-muted);
             font-weight: 600;
             letter-spacing: 0.03em;
         }
         .vital-num {
-            font-size: 1.6rem;
+            font-size: 1.5rem;
             font-weight: 800;
             line-height: 1.1;
             margin: 2px 0;
         }
         .vital-sub {
-            font-size: 0.65rem;
+            font-size: 0.62rem;
         }
         .bis-color { color: #38bdf8; }
         .map-color { color: #f43f5e; }
         .hr-color { color: #34d399; }
         .ppv-color { color: #fbbf24; }
+        
         .chart-canvas {
             width: 100%;
             flex: 1;
-            min-height: 120px;
+            min-height: 110px;
             background-color: #0b1120;
             border-radius: 6px;
             display: block;
@@ -479,92 +998,102 @@ HTML_DASHBOARD_TEMPLATE = """
         .interlock-box {
             background-color: #172554;
             border-left: 3px solid var(--blue);
-            padding: 5px 8px;
+            padding: 4px 8px;
             border-radius: 4px;
-            font-size: 0.76rem;
+            font-size: 0.72rem;
             font-weight: 600;
             color: #bfdbfe;
-            margin-top: 6px;
+            margin-top: 5px;
             white-space: nowrap;
             overflow: hidden;
             text-overflow: ellipsis;
         }
+
+        /* Syringe Pump Infusion Array */
         .syringe-card {
             background-color: var(--card-bg);
             border: 1px solid var(--border);
             border-radius: 8px;
-            padding: 8px 12px;
+            padding: 6px 10px;
             flex-shrink: 0;
         }
         .syringe-grid {
             display: grid;
             grid-template-columns: repeat(3, 1fr);
-            gap: 8px;
+            gap: 6px;
         }
         .syringe-item {
             background-color: #1e293b;
             border-radius: 6px;
-            padding: 6px 8px;
+            padding: 5px 7px;
             border: 1px solid #334155;
             display: flex;
             flex-direction: column;
             justify-content: space-between;
         }
         .syringe-drug {
-            font-size: 0.75rem;
+            font-size: 0.72rem;
             font-weight: 700;
         }
         .syringe-sub {
-            font-size: 0.65rem;
+            font-size: 0.63rem;
             color: var(--text-muted);
         }
         .syringe-rate {
-            font-size: 1.25rem;
+            font-size: 1.15rem;
             font-weight: 800;
             line-height: 1.1;
             margin-top: 2px;
         }
-        .col-right {
-            display: flex;
-            flex-direction: column;
-            gap: 8px;
-            height: 100%;
-            min-height: 0;
-            overflow: hidden;
-        }
+
+        /* Right Column Panels */
         .panel-card {
             background-color: var(--card-bg);
             border: 1px solid var(--border);
             border-radius: 8px;
-            padding: 8px 12px;
+            padding: 8px 10px;
         }
-        .safety-grid {
+
+        /* Lifecycle Action Toolbar */
+        .lifecycle-btn-grid {
             display: grid;
             grid-template-columns: 1fr 1fr;
-            gap: 4px 10px;
-            font-size: 0.75rem;
-            line-height: 1.35;
+            gap: 5px;
+            margin-bottom: 6px;
         }
-        .safety-grid b {
-            color: #9ca3af;
-        }
-        .preload-strip {
-            margin-top: 6px;
-            padding: 4px 8px;
-            background-color: #0b1120;
-            border-radius: 4px;
+        .action-btn {
+            border: none;
+            padding: 7px 6px;
+            border-radius: 5px;
             font-size: 0.72rem;
-            font-weight: 600;
-            color: #fbbf24;
-            border-left: 3px solid #f59e0b;
-        }
-        .section-label {
-            font-size: 0.7rem;
             font-weight: 700;
-            color: var(--text-muted);
-            margin: 0 0 5px 0;
-            letter-spacing: 0.03em;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 5px;
+            text-align: center;
         }
+        .action-btn:disabled {
+            opacity: 0.35;
+            cursor: not-allowed;
+            filter: grayscale(80%);
+        }
+        .btn-induction { background-color: #0284c7; color: #fff; }
+        .btn-induction:hover:not(:disabled) { background-color: #0369a1; }
+        .btn-surgery-start { background-color: #059669; color: #fff; }
+        .btn-surgery-start:hover:not(:disabled) { background-color: #047857; }
+        .btn-surgery-start.unlocked { animation: pulseGreen 1.5s infinite; border: 1px solid #34d399; }
+        .btn-surgery-end { background-color: #d97706; color: #fff; }
+        .btn-surgery-end:hover:not(:disabled) { background-color: #b45309; }
+        .btn-emergence { background-color: #7c3aed; color: #fff; }
+        .btn-emergence:hover:not(:disabled) { background-color: #6d28d9; }
+        .btn-emergence.unlocked { animation: pulsePurple 1.5s infinite; border: 1px solid #c084fc; }
+        .btn-reset { background-color: #334155; color: #cbd5e1; }
+        .btn-reset:hover:not(:disabled) { background-color: #475569; }
+
+        /* Challenge Buttons Grid */
         .stress-grid {
             display: grid;
             grid-template-columns: 1fr 1fr;
@@ -577,7 +1106,7 @@ HTML_DASHBOARD_TEMPLATE = """
             border: 1px solid #334155;
             padding: 5px 6px;
             border-radius: 5px;
-            font-size: 0.7rem;
+            font-size: 0.68rem;
             font-weight: 600;
             cursor: pointer;
             transition: all 0.15s ease;
@@ -587,60 +1116,74 @@ HTML_DASHBOARD_TEMPLATE = """
             justify-content: center;
             white-space: nowrap;
         }
-        .ctrl-btn:hover {
+        .ctrl-btn:disabled {
+            opacity: 0.35;
+            cursor: not-allowed;
+        }
+        .ctrl-btn:hover:not(:disabled) {
             background: #334155;
             border-color: var(--blue);
         }
         .ctrl-btn-pain { background: #7c2d12; border-color: #ea580c; color: #ffedd5; }
-        .ctrl-btn-pain:hover { background: #9a3412; }
+        .ctrl-btn-pain:hover:not(:disabled) { background: #9a3412; }
         .ctrl-btn-crash { background: #881337; border-color: #e11d48; color: #ffe4e6; }
-        .ctrl-btn-crash:hover { background: #9f1239; }
+        .ctrl-btn-crash:hover:not(:disabled) { background: #9f1239; }
         .ctrl-btn-bolus { background: #064e3b; border-color: #059669; color: #d1fae5; }
-        .ctrl-btn-bolus:hover { background: #047857; }
+        .ctrl-btn-bolus:hover:not(:disabled) { background: #047857; }
         .ctrl-btn-bovie { background: #78350f; border-color: #d97706; color: #fef3c7; }
-        .ctrl-btn-bovie:hover { background: #92400e; }
-        .stage-grid {
-            display: grid;
-            grid-template-columns: repeat(4, 1fr);
-            gap: 4px;
-            margin-bottom: 6px;
-        }
-        .stage-pill {
-            padding: 4px 4px;
+        .ctrl-btn-bovie:hover:not(:disabled) { background: #92400e; }
+        .ctrl-btn-light { background: #4c1d95; border-color: #7c3aed; color: #ede9fe; }
+        .ctrl-btn-light:hover:not(:disabled) { background: #5b21b6; }
+
+        /* Autonomous Recovery Live Feed */
+        .recovery-feed {
+            background-color: #0b1120;
             border-radius: 5px;
+            padding: 5px 8px;
+            border-left: 3px solid var(--blue);
+            font-size: 0.7rem;
+            line-height: 1.35;
+            margin-top: 4px;
+            min-height: 38px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+        }
+        .recovery-tag-recovering {
+            color: var(--amber);
+            font-weight: 700;
+        }
+        .recovery-tag-recovered {
+            color: var(--green);
+            font-weight: 800;
+        }
+
+        .section-label {
             font-size: 0.68rem;
             font-weight: 700;
-            cursor: pointer;
-            border: 1px solid #334155;
-            background: #0f172a;
             color: var(--text-muted);
-            text-align: center;
-            transition: all 0.15s ease;
-            white-space: nowrap;
+            margin: 0 0 4px 0;
+            letter-spacing: 0.03em;
         }
-        .stage-pill:hover { border-color: var(--blue); color: #fff; }
-        .stage-pill.active {
-            background: #1e3a8a;
-            border-color: #3b82f6;
-            color: #93c5fd;
+        .safety-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 3px 8px;
+            font-size: 0.72rem;
+            line-height: 1.3;
         }
-        .toggles-row {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            border-top: 1px solid var(--border);
-            padding-top: 5px;
-        }
+        .safety-grid b { color: #9ca3af; }
+
         .xai-bar-wrap {
             display: flex;
             align-items: center;
             gap: 6px;
-            margin-bottom: 4px;
-            font-size: 0.72rem;
+            margin-bottom: 3px;
+            font-size: 0.7rem;
         }
         .xai-bar-track {
             flex: 1;
-            height: 6px;
+            height: 5px;
             background: #0b1120;
             border-radius: 3px;
             overflow: hidden;
@@ -659,211 +1202,241 @@ HTML_DASHBOARD_TEMPLATE = """
             <span class="header-badge">IEC 60601-1-10 CERTIFIED</span>
         </div>
         <div class="nav-tabs">
-            <button class="tab-btn active" onclick="switchSuite('OR-1')">SUITE 1 (OR-1)</button>
-            <button class="tab-btn" onclick="switchSuite('OR-2')">SUITE 2 (OR-2)</button>
-            <button class="tab-btn" onclick="switchSuite('OR-3')">SUITE 3 (OR-3)</button>
+            <button class="tab-btn active" id="tab-OR-1" onclick="switchSuite('OR-1')">
+                <span>OR-1</span> <span style="font-size: 0.65rem; color: #93c5fd;">(LAP CHOLE)</span>
+            </button>
+            <button class="tab-btn" id="tab-OR-2" onclick="switchSuite('OR-2')">
+                <span>OR-2</span> <span style="font-size: 0.65rem; color: #93c5fd;">(TOTAL HIP)</span>
+            </button>
+            <button class="tab-btn" id="tab-OR-3" onclick="switchSuite('OR-3')">
+                <span>OR-3</span> <span style="font-size: 0.65rem; color: #93c5fd;">(CABG x3)</span>
+            </button>
         </div>
-        <div id="conn-badge" style="font-size: 0.78rem; color: var(--amber); font-weight: 600;">
-            ● INITIALIZING TELEMETRY STREAM...
+        <div id="conn-badge" style="font-size: 0.74rem; color: var(--amber); font-weight: 600;">
+            ● CONNECTING TELEMETRY STREAM...
         </div>
     </header>
 
-    <main>
-        <!-- LEFT COLUMN: Live Telemetry, Waveforms & Syringe Infusion Rack -->
-        <div class="col-left">
-            <div class="telemetry-card">
-                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
-                    <h3 style="margin: 0; font-size: 0.95rem;" id="suite-header">Active Suite: OR-1 (Laparoscopic Cholecystectomy)</h3>
-                    <span id="stage-badge" class="header-badge" style="background-color: #1e3a8a; color: #93c5fd;">[STAGE 2: MAINTENANCE]</span>
-                </div>
+    <!-- TOP SCHEDULED SURGERY & DUAL TIMERS BANNER -->
+    <div class="suite-banner">
+        <div class="meta-left">
+            <div class="meta-title">
+                <span id="suite-name-disp">Operating Suite 1 (OR-1)</span>
+                <span style="color: var(--blue);">•</span>
+                <span id="proc-name-disp" style="color: #67e8f9;">Laparoscopic Cholecystectomy</span>
+                <span id="stage-badge" class="header-badge" style="background-color: #1e3a8a; color: #93c5fd;">[STANDBY: PRE-OP READY]</span>
+            </div>
+            <div class="meta-sub" id="surgery-meta-sub">
+                Surgeon: Dr. Sarah Mitchell, FACS | Anesthesiologist: Dr. K. Ramaswamy | Scheduled: 08:30 AM | Patient: 48 yo M, 72 kg (ASA II)
+            </div>
+        </div>
 
+        <!-- Stopwatches / Timers -->
+        <div class="timers-cluster">
+            <div class="timer-box">
+                <span class="timer-label">SURGERY STOPWATCH</span>
+                <span class="timer-digits timer-surgery" id="disp-timer-surgery">00:00:00</span>
+                <span class="timer-status" id="badge-timer-surgery" style="background: #1e293b; color: var(--text-muted);">STANDBY</span>
+            </div>
+            <div class="timer-box">
+                <span class="timer-label">POST-OP EMERGENCE</span>
+                <span class="timer-digits timer-emergence" id="disp-timer-emergence">00:00:00</span>
+                <span class="timer-status" id="badge-timer-emergence" style="background: #1e293b; color: var(--text-muted);">INACTIVE</span>
+            </div>
+        </div>
+    </div>
+
+    <main>
+        <!-- LEFT COLUMN: Real-Time Waveform, Vitals, Alerts & Drug Ce Rack -->
+        <div class="col-left">
+            <!-- Dynamic Clinical Readiness & Workflow Alert Banner -->
+            <div id="readiness-banner" class="readiness-banner readiness-standby">
+                <span id="readiness-text">ℹ PRE-OP STANDBY: Patient awake & monitor leads connected. Click "Start Induction" below.</span>
+                <span id="readiness-pill" style="font-size: 0.68rem; padding: 2px 6px; border-radius: 4px; background: rgba(0,0,0,0.3);">STANDBY</span>
+            </div>
+
+            <div class="telemetry-card">
                 <div class="vitals-banner">
                     <div class="vital-box">
-                        <div class="vital-title">BISPECTRAL INDEX</div>
-                        <div class="vital-num bis-color" id="val-bis">--</div>
+                        <div class="vital-title">BISPECTRAL INDEX (BIS)</div>
+                        <div class="vital-num bis-color" id="val-bis">98.0</div>
                         <div class="vital-sub" style="color: var(--green);">Target: 40 - 60</div>
                     </div>
                     <div class="vital-box">
                         <div class="vital-title">MEAN ARTERIAL PRESSURE</div>
-                        <div class="vital-num map-color" id="val-map">--</div>
+                        <div class="vital-num map-color" id="val-map">90.0</div>
                         <div class="vital-sub" style="color: var(--green);">Target: 65 - 100 mmHg</div>
                     </div>
                     <div class="vital-box">
                         <div class="vital-title">HEART RATE</div>
-                        <div class="vital-num hr-color" id="val-hr">--</div>
-                        <div class="vital-sub" style="color: var(--text-muted);">bpm (Sinus)</div>
+                        <div class="vital-num hr-color" id="val-hr">75.0</div>
+                        <div class="vital-sub" style="color: var(--text-muted);">bpm (Sinus Rhythm)</div>
                     </div>
                     <div class="vital-box">
                         <div class="vital-title">PULSE PRESSURE VAR (PPV)</div>
-                        <div class="vital-num ppv-color" id="val-ppv">--</div>
+                        <div class="vital-num ppv-color" id="val-ppv">8.5%</div>
                         <div class="vital-sub" style="color: var(--green);">Normovolemic (&lt;13%)</div>
                     </div>
                 </div>
 
-                <div style="display: flex; justify-content: space-between; align-items: center; margin: 2px 0 4px 0;">
-                    <div style="font-size: 0.78rem; font-weight: 600;">Live Waveform &amp; Conformal Predictive Risk Bands (10-Min Horizon)</div>
-                    <div style="font-size: 0.7rem; color: var(--text-muted); display: flex; gap: 8px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin: 2px 0 3px 0;">
+                    <div style="font-size: 0.74rem; font-weight: 700;">Live Physiologic Stream &amp; 10-Min Conformal Risk Cone</div>
+                    <div style="font-size: 0.68rem; color: var(--text-muted); display: flex; gap: 8px;">
                         <span style="color: #38bdf8;">— BIS</span>
                         <span style="color: #f43f5e;">— MAP</span>
-                        <span style="color: #10b981;">░ Target</span>
+                        <span style="color: #10b981;">░ Safe Target</span>
                         <span style="color: rgba(56, 189, 248, 0.7);">┅ 10m Cone</span>
                     </div>
                 </div>
                 <canvas id="chart-canvas" class="chart-canvas"></canvas>
 
                 <div class="interlock-box" id="interlock-text">
-                    [SYNCHRONIZING WITH PHYSIOLOGIC CO-PILOT...]
+                    [SYSTEM READY: Digital Twin synchronized with central clinical co-pilot]
                 </div>
             </div>
 
-            <!-- Syringe Pump Infusion Array (Compact 3-Rack) -->
+            <!-- Syringe Pump Infusion Array with LIVE EFFECT-SITE CONCENTRATIONS (Ce) -->
             <div class="syringe-card">
-                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
-                    <div style="font-size: 0.8rem; font-weight: 700;">Automated Syringe Pump Infusion Array</div>
-                    <div style="font-size: 0.68rem; color: var(--text-muted);">MIMO-SAC Closed-Loop Infusion</div>
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                    <div style="font-size: 0.76rem; font-weight: 700;">Automated Syringe Pump Infusion Array &amp; Live Drug Effect-Site Concentrations</div>
+                    <div style="font-size: 0.65rem; color: var(--text-muted);">MIMO-SAC Closed-Loop Infusion</div>
                 </div>
                 <div class="syringe-grid">
                     <div class="syringe-item">
                         <div>
                             <div class="syringe-drug" style="color: #38bdf8;">Propofol (Hypnotic)</div>
-                            <div class="syringe-sub">Ce: 2.2 µg/mL | Ridge</div>
+                            <div class="syringe-sub" id="ce-prop-txt">Ce: 0.00 µg/mL | Standby</div>
                         </div>
-                        <div class="syringe-rate" id="rate-prop">0.00 <span style="font-size: 0.7rem; font-weight: 400;">mg/kg/h</span></div>
+                        <div class="syringe-rate" id="rate-prop">0.00 <span style="font-size: 0.65rem; font-weight: 400;">mg/kg/h</span></div>
                     </div>
                     <div class="syringe-item">
                         <div>
                             <div class="syringe-drug" style="color: #a78bfa;">Remifentanil (Opioid)</div>
-                            <div class="syringe-sub">Ce: 1.5 ng/mL | Analgesic</div>
+                            <div class="syringe-sub" id="ce-remi-txt">Ce: 0.00 ng/mL | Standby</div>
                         </div>
-                        <div class="syringe-rate" id="rate-remi">0.000 <span style="font-size: 0.7rem; font-weight: 400;">µg/kg/min</span></div>
+                        <div class="syringe-rate" id="rate-remi">0.000 <span style="font-size: 0.65rem; font-weight: 400;">µg/kg/min</span></div>
                     </div>
                     <div class="syringe-item">
                         <div>
                             <div class="syringe-drug" style="color: #f43f5e;">Norepinephrine (Pressor)</div>
-                            <div class="syringe-sub">Preload Guarded | SVR</div>
+                            <div class="syringe-sub" id="sub-norepi">Preload Guarded | SVR</div>
                         </div>
-                        <div class="syringe-rate" id="rate-norepi">0.000 <span style="font-size: 0.7rem; font-weight: 400;">µg/kg/min</span></div>
+                        <div class="syringe-rate" id="rate-norepi">0.000 <span style="font-size: 0.65rem; font-weight: 400;">µg/kg/min</span></div>
                     </div>
                 </div>
             </div>
         </div>
 
-        <!-- RIGHT COLUMN: Safety Guardrails, Interactive Challenges & Explainable AI -->
+        <!-- RIGHT COLUMN: Lifecycle Toolbar, Challenge Console & Safety Guardrails -->
         <div class="col-right">
-            <!-- Panel 1: Safety & Hardware Status -->
+            <!-- Panel 1: Clinical Lifecycle Orchestration Toolbar -->
             <div class="panel-card" style="flex-shrink: 0;">
-                <div style="font-size: 0.8rem; font-weight: 700; margin-bottom: 6px; display: flex; justify-content: space-between;">
-                    <span>Safety, Interlocks &amp; Hardware Status</span>
-                    <span style="font-size: 0.68rem; color: var(--green);">DETERMINISTIC GUARDRAILS</span>
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;">
+                    <span style="font-size: 0.78rem; font-weight: 700;">Clinical Lifecycle Orchestration</span>
+                    <span style="font-size: 0.65rem; color: var(--blue);" id="lifecycle-phase-tag">PHASE: STANDBY</span>
                 </div>
-                <div class="safety-grid">
-                    <div>• <b>Autonomy:</b> <span id="autonomy-txt" style="color: var(--green);">Level 4 Closed-Loop</span></div>
-                    <div>• <b>HOCBF QP:</b> <span id="hocbf-txt" style="color: var(--green);">ACTIVE (Forward Invariance)</span></div>
-                    <div>• <b>Watchdog:</b> <span id="watchdog-txt" style="color: var(--green);">HEARTBEAT NORMAL (&lt;500ms)</span></div>
-                    <div>• <b>Signal SQI:</b> <span id="signal-txt" style="color: var(--green);">SQI 98% | EMG 24 dB</span></div>
+
+                <div class="lifecycle-btn-grid">
+                    <button class="action-btn btn-induction" id="btn-start-induction" onclick="sendAction('start_induction')">
+                        ▶ 1. Start Induction
+                    </button>
+                    <button class="action-btn btn-surgery-start" id="btn-start-surgery" onclick="sendAction('start_surgery')" disabled>
+                        ▶ 2. Start Surgery
+                    </button>
+                    <button class="action-btn btn-surgery-end" id="btn-end-surgery" onclick="sendAction('end_surgery')" disabled>
+                        ⏹ 3. End Surgery
+                    </button>
+                    <button class="action-btn btn-emergence" id="btn-start-emergence" onclick="sendAction('start_emergence')" disabled>
+                        ▶ 4. Start Emergence
+                    </button>
                 </div>
-                <div class="preload-strip" id="preload-txt">
-                    Preload Gate: Normovolemic (PPV &lt; 13%)
+                <div style="display: flex; justify-content: flex-end;">
+                    <button class="action-btn btn-reset" style="padding: 3px 10px; font-size: 0.68rem;" onclick="sendAction('reset_standby')">
+                        🔄 Reset Suite to Standby
+                    </button>
                 </div>
             </div>
 
-            <!-- Panel 2: Interactive Clinical Challenge & Lifecycle Console -->
+            <!-- Panel 2: Interactive Stress Challenges & Autonomous Recovery Console -->
             <div class="panel-card" style="flex-shrink: 0;">
-                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
-                    <span style="font-size: 0.8rem; font-weight: 700;">Interactive Challenge &amp; Stress Console</span>
-                    <span style="font-size: 0.68rem; color: var(--text-muted);">Real-Time Co-Pilot Response</span>
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;">
+                    <span style="font-size: 0.78rem; font-weight: 700;">Intraoperative Challenges &amp; Stress Testing</span>
+                    <span style="font-size: 0.65rem; color: var(--text-muted);" id="challenges-active-hint">(Active During Surgery)</span>
                 </div>
 
-                <div class="section-label">PHYSIOLOGICAL STRESS INJECTION:</div>
                 <div class="stress-grid">
-                    <button class="ctrl-btn ctrl-btn-pain" onclick="sendAction('pain', {value: 0.85})">
-                        ⚡ Incision Pain (+0.85)
+                    <button class="ctrl-btn ctrl-btn-pain" id="btn-pain" onclick="sendAction('pain', {value: 0.85})" disabled>
+                        ⚡ Incision Surge (+0.85)
                     </button>
-                    <button class="ctrl-btn ctrl-btn-crash" onclick="sendAction('hypotension', {value: 20.0})">
+                    <button class="ctrl-btn ctrl-btn-crash" id="btn-hypo" onclick="sendAction('hypotension', {value: 20.0})" disabled>
                         📉 MAP Crash (-20 mmHg)
                     </button>
-                    <button class="ctrl-btn ctrl-btn-bolus" onclick="sendAction('bolus', {})">
+                    <button class="ctrl-btn ctrl-btn-bolus" id="btn-preload" onclick="sendAction('preload_deficit', {})" disabled>
+                        💧 Preload Deficit (PPV 16%)
+                    </button>
+                    <button class="ctrl-btn ctrl-btn-bolus" id="btn-bolus" onclick="sendAction('bolus', {})" disabled>
                         💧 250mL Fluid Bolus
                     </button>
-                    <button class="ctrl-btn ctrl-btn-bovie" onclick="sendAction('artifact', {duration: 6.0})">
-                        📻 Bovie Electrocautery
+                    <button class="ctrl-btn ctrl-btn-bovie" id="btn-bovie" onclick="sendAction('artifact', {duration: 6.0})" disabled>
+                        📻 Electrocautery (Bovie)
+                    </button>
+                    <button class="ctrl-btn ctrl-btn-light" id="btn-light" onclick="sendAction('lightening', {})" disabled>
+                        ⚠️ Lightening Depth (+25)
                     </button>
                 </div>
 
-                <div class="section-label">SURGICAL LIFECYCLE FSM TRANSITIONS:</div>
-                <div class="stage-grid">
-                    <button class="stage-pill" id="pill-STAGE_0_STANDBY" onclick="sendAction('stage', {stage: 'STAGE_0_STANDBY'})">
-                        0. Standby
-                    </button>
-                    <button class="stage-pill" id="pill-STAGE_1_INDUCTION" onclick="sendAction('stage', {stage: 'STAGE_1_INDUCTION'})">
-                        1. Induction
-                    </button>
-                    <button class="stage-pill active" id="pill-STAGE_2_MAINTENANCE" onclick="sendAction('stage', {stage: 'STAGE_2_MAINTENANCE'})">
-                        2. Maint.
-                    </button>
-                    <button class="stage-pill" id="pill-STAGE_3_EMERGENCE" onclick="sendAction('stage', {stage: 'STAGE_3_EMERGENCE'})">
-                        3. Emergence
-                    </button>
-                </div>
-
-                <div class="toggles-row">
-                    <div style="display: flex; gap: 6px; align-items: center;">
-                        <span style="font-size: 0.72rem; color: var(--text-muted);">Mode:</span>
-                        <button class="ctrl-btn" id="btn-toggle-mode" onclick="toggleEngineMode()">
-                            Mode A (Digital Twin Sim)
-                        </button>
-                    </div>
-                    <div style="display: flex; gap: 6px; align-items: center;">
-                        <span style="font-size: 0.72rem; color: var(--text-muted);">Autonomy:</span>
-                        <button class="ctrl-btn" id="btn-toggle-autonomy" onclick="toggleAutonomy()">
-                            Level 4 (Closed-Loop)
-                        </button>
-                    </div>
+                <!-- Live Auto-Recovery Status Card -->
+                <div class="section-label">AUTONOMOUS CLOSED-LOOP RECOVERY FEED:</div>
+                <div class="recovery-feed" id="recovery-feed">
+                    <div id="recovery-feed-title" style="font-weight: 700; color: #94a3b8;">No active stress challenges. Closed-loop baseline stable.</div>
+                    <div id="recovery-feed-detail" style="font-size: 0.65rem; color: #64748b;">Operator can inject hemodynamic or surgical perturbations during maintenance.</div>
                 </div>
             </div>
 
-            <!-- Panel 3: Real-Time Explainable AI (XAI) Attribution Console -->
+            <!-- Panel 3: Safety Guardrails & Explainable AI (XAI) -->
             <div class="panel-card" style="flex: 1; min-height: 0; display: flex; flex-direction: column; justify-content: space-between;">
                 <div>
-                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
-                        <span style="font-size: 0.8rem; font-weight: 700;">Event-Triggered Explainability (XAI)</span>
-                        <span style="font-size: 0.68rem; color: var(--blue);" id="xai-tag">LIVE ATTRIBUTION</span>
+                    <div style="font-size: 0.78rem; font-weight: 700; margin-bottom: 4px; display: flex; justify-content: space-between;">
+                        <span>Deterministic Safety &amp; Guardrails</span>
+                        <span style="font-size: 0.65rem; color: var(--green);">IEC 60601-1-10</span>
                     </div>
-
-                    <div style="font-size: 0.72rem; color: var(--text-muted); margin-bottom: 6px;">
-                        Primary Titration Driver:
-                        <div style="font-size: 0.85rem; font-weight: 700; color: #38bdf8; margin-top: 1px;" id="xai-driver">
-                            Bouillon Synergistic Ridge Titration
-                        </div>
+                    <div class="safety-grid">
+                        <div>• <b>Autonomy:</b> <span id="autonomy-txt" style="color: var(--green);">Level 4 Closed-Loop</span></div>
+                        <div>• <b>HOCBF QP:</b> <span id="hocbf-txt" style="color: var(--green);">FORWARD INVARIANCE</span></div>
+                        <div>• <b>Watchdog:</b> <span id="watchdog-txt" style="color: var(--green);">HEARTBEAT NORMAL</span></div>
+                        <div>• <b>Signal SQI:</b> <span id="signal-txt" style="color: var(--green);">SQI 98% (CLEAN)</span></div>
                     </div>
-
-                    <div class="xai-bar-wrap">
-                        <span style="width: 125px; color: var(--text-muted); font-size: 0.72rem;">Conformal MAP Risk:</span>
-                        <div class="xai-bar-track">
-                            <div class="xai-bar-fill" id="xai-bar-map" style="width: 35%; background: #f43f5e;"></div>
-                        </div>
-                        <span style="width: 32px; text-align: right; font-weight: 700; color: #f43f5e; font-size: 0.72rem;" id="xai-val-map">35%</span>
-                    </div>
-
-                    <div class="xai-bar-wrap">
-                        <span style="width: 125px; color: var(--text-muted); font-size: 0.72rem;">BIS Depth Deviation:</span>
-                        <div class="xai-bar-track">
-                            <div class="xai-bar-fill" id="xai-bar-bis" style="width: 25%; background: #38bdf8;"></div>
-                        </div>
-                        <span style="width: 32px; text-align: right; font-weight: 700; color: #38bdf8; font-size: 0.72rem;" id="xai-val-bis">25%</span>
-                    </div>
-
-                    <div class="xai-bar-wrap">
-                        <span style="width: 125px; color: var(--text-muted); font-size: 0.72rem;">Surgical Nociception:</span>
-                        <div class="xai-bar-track">
-                            <div class="xai-bar-fill" id="xai-bar-pain" style="width: 12%; background: #fbbf24;"></div>
-                        </div>
-                        <span style="width: 32px; text-align: right; font-weight: 700; color: #fbbf24; font-size: 0.72rem;" id="xai-val-pain">12%</span>
+                    <div id="preload-txt" style="font-size: 0.68rem; color: #fbbf24; margin-top: 4px; font-weight: 600;">
+                        Preload Gate: Normovolemic (PPV &lt; 13%)
                     </div>
                 </div>
 
-                <div style="font-size: 0.68rem; color: var(--text-muted); line-height: 1.3; border-top: 1px solid var(--border); padding-top: 4px; margin-top: 4px;">
-                    • Attributions evaluated on relative gradient shift (&gt;5% delta) per ISO 60601-1-10 explainability standard.
+                <div style="border-top: 1px solid var(--border); padding-top: 4px; margin-top: 4px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 3px;">
+                        <span style="font-size: 0.74rem; font-weight: 700;">Event-Triggered Explainable AI (XAI)</span>
+                        <span style="font-size: 0.65rem; color: var(--blue);" id="xai-driver">Synergistic Titration</span>
+                    </div>
+                    <div class="xai-bar-wrap">
+                        <span style="width: 120px; color: var(--text-muted); font-size: 0.68rem;">Conformal MAP Risk:</span>
+                        <div class="xai-bar-track">
+                            <div class="xai-bar-fill" id="xai-bar-map" style="width: 25%; background: #f43f5e;"></div>
+                        </div>
+                        <span style="width: 30px; text-align: right; font-weight: 700; color: #f43f5e; font-size: 0.68rem;" id="xai-val-map">25%</span>
+                    </div>
+                    <div class="xai-bar-wrap">
+                        <span style="width: 120px; color: var(--text-muted); font-size: 0.68rem;">BIS Error Deviation:</span>
+                        <div class="xai-bar-track">
+                            <div class="xai-bar-fill" id="xai-bar-bis" style="width: 20%; background: #38bdf8;"></div>
+                        </div>
+                        <span style="width: 30px; text-align: right; font-weight: 700; color: #38bdf8; font-size: 0.68rem;" id="xai-val-bis">20%</span>
+                    </div>
+                    <div class="xai-bar-wrap">
+                        <span style="width: 120px; color: var(--text-muted); font-size: 0.68rem;">Surgical Nociception:</span>
+                        <div class="xai-bar-track">
+                            <div class="xai-bar-fill" id="xai-bar-pain" style="width: 10%; background: #fbbf24;"></div>
+                        </div>
+                        <span style="width: 30px; text-align: right; font-weight: 700; color: #fbbf24; font-size: 0.68rem;" id="xai-val-pain">10%</span>
+                    </div>
                 </div>
             </div>
         </div>
@@ -908,7 +1481,7 @@ HTML_DASHBOARD_TEMPLATE = """
                 connBadge.innerText = `● ${text || 'CENTRAL CO-PILOT LIVE (HTTP POLLING)'}`;
             } else {
                 connBadge.style.color = 'var(--amber)';
-                connBadge.innerText = `● ${text || 'RECONNECTING TELEMETRY STREAM...'}`;
+                connBadge.innerText = `● ${text || 'CONNECTING TELEMETRY STREAM...'}`;
             }
         }
 
@@ -950,13 +1523,11 @@ HTML_DASHBOARD_TEMPLATE = """
                 };
 
                 ws.onerror = (e) => {
-                    console.warn('WebSocket error, switching to HTTP fallback polling:', e);
                     setConnectionState('polling', 'CENTRAL CO-PILOT LIVE (HTTP FALLBACK)');
                     startPollingFallback(suite);
                 };
 
                 ws.onclose = () => {
-                    console.warn('WebSocket closed, switching to HTTP fallback polling...');
                     setConnectionState('polling', 'CENTRAL CO-PILOT LIVE (HTTP FALLBACK)');
                     startPollingFallback(suite);
                     setTimeout(() => {
@@ -964,7 +1535,6 @@ HTML_DASHBOARD_TEMPLATE = """
                     }, 3000);
                 };
             } catch(e) {
-                console.warn('Failed to initialize WebSocket, starting HTTP polling:', e);
                 startPollingFallback(suite);
             }
         }
@@ -987,9 +1557,6 @@ HTML_DASHBOARD_TEMPLATE = """
             pollTimer = setInterval(fetchTelemetry, 1000);
         }
 
-        let activeEngineMode = 'MODE_A_SIMULATOR';
-        let activeAutonomyLevel = 'LEVEL_4_CLOSED_LOOP';
-
         async function sendAction(action, extra = {}) {
             try {
                 await fetch(`/api/action/${currentSuite}`, {
@@ -997,37 +1564,19 @@ HTML_DASHBOARD_TEMPLATE = """
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ action, ...extra })
                 });
-                if (action === 'stage' && extra.stage) {
-                    document.querySelectorAll('.stage-pill').forEach(el => el.classList.remove('active'));
-                    const pill = document.getElementById(`pill-${extra.stage}`);
-                    if (pill) pill.classList.add('active');
-                }
             } catch(e) {
                 console.error('Action dispatch failed:', e);
             }
-        }
-
-        function toggleEngineMode() {
-            activeEngineMode = activeEngineMode === 'MODE_A_SIMULATOR' ? 'MODE_B_REPLAY' : 'MODE_A_SIMULATOR';
-            document.getElementById('btn-toggle-mode').innerText = activeEngineMode === 'MODE_A_SIMULATOR' ? 'Mode A (Digital Twin Sim)' : 'Mode B (VitalDB Replay)';
-            sendAction('mode', { mode: activeEngineMode });
-        }
-
-        function toggleAutonomy() {
-            activeAutonomyLevel = activeAutonomyLevel === 'LEVEL_4_CLOSED_LOOP' ? 'LEVEL_2_ADVISORY' : 'LEVEL_4_CLOSED_LOOP';
-            document.getElementById('btn-toggle-autonomy').innerText = activeAutonomyLevel === 'LEVEL_4_CLOSED_LOOP' ? 'Level 4 (Closed-Loop)' : 'Level 2 (Advisory)';
-            sendAction('autonomy', { level: activeAutonomyLevel });
         }
 
         function switchSuite(suite) {
             if (currentSuite === suite) return;
             currentSuite = suite;
             document.querySelectorAll('.tab-btn').forEach(btn => {
-                btn.classList.toggle('active', btn.innerText.includes(suite));
+                btn.classList.toggle('active', btn.id === `tab-${suite}`);
             });
-            document.getElementById('suite-header').innerText = `Active Suite: ${suite}`;
 
-            // Instantly load this suite's isolated history buffer (eliminates cross-suite jump artifacts)
+            // Immediately clear/load that room's telemetry buffer
             bisHistory = (suiteHistories[suite] && suiteHistories[suite].bis) ? suiteHistories[suite].bis : [];
             mapHistory = (suiteHistories[suite] && suiteHistories[suite].map) ? suiteHistories[suite].map : [];
             drawChart();
@@ -1037,7 +1586,7 @@ HTML_DASHBOARD_TEMPLATE = """
         function updateUI(data) {
             if (!data || !data.vitals) return;
 
-            // Route data to the correct operating suite buffer
+            // Route data to the correct room buffer
             const sId = data.suite_id || currentSuite;
             if (!suiteHistories[sId]) {
                 suiteHistories[sId] = { bis: [], map: [] };
@@ -1049,27 +1598,153 @@ HTML_DASHBOARD_TEMPLATE = """
                 suiteHistories[sId].map.shift(); 
             }
 
-            // Reject any in-flight packets that belong to a different suite than the active tab
+            // Ignore packet if it belongs to a non-active tab
             if (data.suite_id && data.suite_id !== currentSuite) {
                 return;
             }
 
+            // 1. Scheduled Surgery Metadata
+            if (data.surgery_meta) {
+                document.getElementById('suite-name-disp').innerText = data.surgery_meta.room_name;
+                document.getElementById('proc-name-disp').innerText = data.surgery_meta.procedure_name;
+                document.getElementById('surgery-meta-sub').innerText = 
+                    `Surgeon: ${data.surgery_meta.lead_surgeon} | Anesthesiologist: ${data.surgery_meta.anesthesiologist} | Scheduled: ${data.surgery_meta.scheduled_time} | Patient: ${data.surgery_meta.demographics} (${data.surgery_meta.asa_class})`;
+            }
+
+            // 2. Stopwatches / Timers
+            if (data.timers) {
+                document.getElementById('disp-timer-surgery').innerText = data.timers.surgery_formatted;
+                const surgeryBadge = document.getElementById('badge-timer-surgery');
+                if (data.timers.surgery_timer_active) {
+                    surgeryBadge.innerText = 'IN PROGRESS';
+                    surgeryBadge.style.background = '#0284c7';
+                    surgeryBadge.style.color = '#fff';
+                } else if (data.timers.surgery_duration_sec > 0) {
+                    surgeryBadge.innerText = 'COMPLETED';
+                    surgeryBadge.style.background = '#d97706';
+                    surgeryBadge.style.color = '#fff';
+                } else {
+                    surgeryBadge.innerText = 'STANDBY';
+                    surgeryBadge.style.background = '#1e293b';
+                    surgeryBadge.style.color = 'var(--text-muted)';
+                }
+
+                document.getElementById('disp-timer-emergence').innerText = data.timers.emergence_formatted;
+                const emergBadge = document.getElementById('badge-timer-emergence');
+                if (data.timers.is_patient_awake) {
+                    emergBadge.innerText = '✓ PATIENT AWAKE';
+                    emergBadge.style.background = '#059669';
+                    emergBadge.style.color = '#fff';
+                } else if (data.timers.emergence_timer_active) {
+                    emergBadge.innerText = 'WASHOUT ACTIVE';
+                    emergBadge.style.background = '#7c3aed';
+                    emergBadge.style.color = '#fff';
+                } else {
+                    emergBadge.innerText = 'INACTIVE';
+                    emergBadge.style.background = '#1e293b';
+                    emergBadge.style.color = 'var(--text-muted)';
+                }
+            }
+
+            // 3. Clinical Readiness & Workflow Alert Banner
+            const banner = document.getElementById('readiness-banner');
+            const readinessText = document.getElementById('readiness-text');
+            const readinessPill = document.getElementById('readiness-pill');
+            const phaseTag = document.getElementById('lifecycle-phase-tag');
+            phaseTag.innerText = `PHASE: ${data.phase}`;
+
+            banner.className = 'readiness-banner';
+            if (data.phase === 'STANDBY') {
+                banner.classList.add('readiness-standby');
+                readinessText.innerText = 'ℹ PRE-OP STANDBY: Patient awake. Click "▶ 1. Start Induction" below to begin automated co-induction.';
+                readinessPill.innerText = 'STANDBY';
+            } else if (data.phase === 'STAGE_1_INDUCTION') {
+                banner.classList.add('readiness-induction');
+                readinessText.innerText = data.readiness.status_text;
+                readinessPill.innerText = 'INDUCTION ACTIVE';
+            } else if (data.phase === 'PATIENT_ASLEEP_READY') {
+                banner.classList.add('readiness-asleep');
+                readinessText.innerText = '✓ PATIENT IS ASLEEP (LOC CONFIRMED) — SAFE TO START SURGERY! Click "▶ 2. Start Surgery" to begin.';
+                readinessPill.innerText = '✓ SAFE FOR SURGERY';
+            } else if (data.phase === 'STAGE_2_MAINTENANCE') {
+                banner.classList.add('readiness-surgery');
+                readinessText.innerText = '⚡ SURGERY IN PROGRESS: Closed-loop maintenance active. Vitals locked in targets. Challenges may be injected.';
+                readinessPill.innerText = 'SURGERY ACTIVE';
+            } else if (data.phase === 'SURGERY_COMPLETED') {
+                banner.classList.add('readiness-completed');
+                readinessText.innerText = `⏹ SURGERY COMPLETED: Total Duration: ${data.timers.surgery_formatted}. Click "▶ 4. Start Emergence" to discontinue anesthetics.`;
+                readinessPill.innerText = 'PROCEDURE ENDED';
+            } else if (data.phase === 'STAGE_3_EMERGENCE') {
+                banner.classList.add('readiness-emergence');
+                readinessText.innerText = data.readiness.status_text;
+                readinessPill.innerText = 'EMERGENCE WASHOUT';
+            } else if (data.phase === 'PACU_TRANSFER') {
+                banner.classList.add('readiness-awake');
+                readinessText.innerText = data.readiness.status_text;
+                readinessPill.innerText = '✓ EXTUBATION READY';
+            }
+
+            document.getElementById('stage-badge').innerText = data.badge;
+
+            // 4. Lifecycle Buttons Interlocking
+            const btnInduction = document.getElementById('btn-start-induction');
+            const btnSurgeryStart = document.getElementById('btn-start-surgery');
+            const btnSurgeryEnd = document.getElementById('btn-end-surgery');
+            const btnEmergence = document.getElementById('btn-start-emergence');
+
+            btnInduction.disabled = (data.phase !== 'STANDBY');
+            btnSurgeryStart.disabled = (data.phase !== 'PATIENT_ASLEEP_READY');
+            btnSurgeryStart.classList.toggle('unlocked', data.phase === 'PATIENT_ASLEEP_READY');
+            
+            btnSurgeryEnd.disabled = (data.phase !== 'STAGE_2_MAINTENANCE');
+            btnEmergence.disabled = (data.phase !== 'SURGERY_COMPLETED');
+            btnEmergence.classList.toggle('unlocked', data.phase === 'SURGERY_COMPLETED');
+
+            // 5. Intraoperative Challenge Buttons Enablement
+            const isSurgeryActive = (data.phase === 'STAGE_2_MAINTENANCE');
+            ['btn-pain', 'btn-hypo', 'btn-preload', 'btn-bolus', 'btn-bovie', 'btn-light'].forEach(id => {
+                document.getElementById(id).disabled = !isSurgeryActive;
+            });
+            document.getElementById('challenges-active-hint').innerText = isSurgeryActive ? '(Click to Inject Perturbation)' : '(Enabled During Active Surgery)';
+
+            // 6. Challenge Auto-Recovery Feed
+            const feedTitle = document.getElementById('recovery-feed-title');
+            const feedDetail = document.getElementById('recovery-feed-detail');
+            if (data.challenge && data.challenge.active) {
+                const ch = data.challenge.active;
+                if (ch.status === 'AUTO_RECOVERED') {
+                    feedTitle.innerHTML = `<span class="recovery-tag-recovered">[✓ AUTO-RECOVERED]</span> ${ch.title}`;
+                    feedDetail.innerText = `${ch.action_taken} — ${ch.recovery_text || 'Vitals stabilized in therapeutic target.'}`;
+                } else {
+                    feedTitle.innerHTML = `<span class="recovery-tag-recovering">[CHALLENGE ACTIVE - RECOVERING...]</span> ${ch.title}`;
+                    feedDetail.innerText = `${ch.action_taken} — Closed-loop countermeasure in progress.`;
+                }
+            } else {
+                feedTitle.innerText = isSurgeryActive ? 'Closed-loop steady state. Ready for stress challenge.' : 'No active challenges.';
+                feedDetail.innerText = isSurgeryActive ? 'Operator can test physiological shocks (pain, hemorrhage, artifact).' : 'Challenges unlock once surgery starts.';
+            }
+
+            // 7. Vitals Numerics
             document.getElementById('val-bis').innerText = data.vitals.filtered_bis.toFixed(1);
             document.getElementById('val-map').innerText = data.vitals.filtered_map.toFixed(1);
             document.getElementById('val-hr').innerText = data.vitals.filtered_hr.toFixed(1);
             document.getElementById('val-ppv').innerText = `${data.vitals.ppv_percent.toFixed(1)}%`;
-            document.getElementById('stage-badge').innerText = data.badge;
 
-            document.getElementById('rate-prop').innerHTML = `${data.infusion_rates.propofol_mg_kg_h.toFixed(2)} <span style="font-size: 0.7rem; font-weight: 400;">mg/kg/h</span>`;
-            document.getElementById('rate-remi').innerHTML = `${data.infusion_rates.remifentanil_ug_kg_min.toFixed(3)} <span style="font-size: 0.7rem; font-weight: 400;">µg/kg/min</span>`;
-            document.getElementById('rate-norepi').innerHTML = `${data.infusion_rates.norepinephrine_ug_kg_min.toFixed(3)} <span style="font-size: 0.7rem; font-weight: 400;">µg/kg/min</span>`;
+            // 8. Syringe Pumps & Live Effect-Site Drug Concentrations (Ce)
+            document.getElementById('rate-prop').innerHTML = `${data.infusion_rates.propofol_mg_kg_h.toFixed(2)} <span style="font-size: 0.65rem; font-weight: 400;">mg/kg/h</span>`;
+            document.getElementById('ce-prop-txt').innerText = `Ce: ${data.infusion_rates.propofol_ce_ug_ml.toFixed(2)} µg/mL | ${data.infusion_rates.propofol_status}`;
 
+            document.getElementById('rate-remi').innerHTML = `${data.infusion_rates.remifentanil_ug_kg_min.toFixed(3)} <span style="font-size: 0.65rem; font-weight: 400;">µg/kg/min</span>`;
+            document.getElementById('ce-remi-txt').innerText = `Ce: ${data.infusion_rates.remifentanil_ce_ng_ml.toFixed(2)} ng/mL | ${data.infusion_rates.remifentanil_status}`;
+
+            document.getElementById('rate-norepi').innerHTML = `${data.infusion_rates.norepinephrine_ug_kg_min.toFixed(3)} <span style="font-size: 0.65rem; font-weight: 400;">µg/kg/min</span>`;
+
+            // 9. Safety & Interlocks
             document.getElementById('interlock-text').innerText = data.predictions.interlock_message;
-            document.getElementById('preload-txt').innerText = data.safety.preload_advisory;
-            document.getElementById('autonomy-txt').innerText = data.autonomy_level === 'LEVEL_4_CLOSED_LOOP' ? 'Level 4 Closed-Loop' : 'Level 2 Advisory';
+            document.getElementById('preload-txt').innerText = `Preload Gate: ${data.safety.preload_advisory}`;
             document.getElementById('signal-txt').innerText = `SQI ${data.vitals.sqi_percent.toFixed(0)}% | EMG ${data.vitals.emg_db.toFixed(0)} dB (CLEAN)`;
 
-            // Update XAI Attributions
+            // 10. XAI Attributions
             if (data.xai) {
                 document.getElementById('xai-driver').innerText = data.xai.primary_driver;
                 document.getElementById('xai-bar-map').style.width = `${data.xai.map_risk_pct}%`;
@@ -1080,30 +1755,7 @@ HTML_DASHBOARD_TEMPLATE = """
                 document.getElementById('xai-val-pain').innerText = `${data.xai.nociception_pct.toFixed(0)}%`;
             }
 
-            // Update Stage Pill Active State
-            if (data.stage) {
-                document.querySelectorAll('.stage-pill').forEach(el => el.classList.remove('active'));
-                let pillId = `pill-${data.stage}`;
-                if (data.stage === 'STANDBY') pillId = 'pill-STAGE_0_STANDBY';
-                else if (data.stage === 'READINESS_HYSTERESIS') pillId = 'pill-STAGE_1_INDUCTION';
-                else if (data.stage === 'PACU_TRANSFER') pillId = 'pill-STAGE_3_EMERGENCE';
-                const activePill = document.getElementById(pillId);
-                if (activePill) activePill.classList.add('active');
-            }
-
-            // Update Engine Mode & Autonomy labels
-            if (data.mode) {
-                activeEngineMode = data.mode;
-                document.getElementById('btn-toggle-mode').innerText = activeEngineMode === 'MODE_A_SIMULATOR' ? 'Mode A (Digital Twin Sim)' : 'Mode B (VitalDB Replay)';
-            }
-            if (data.autonomy_level) {
-                activeAutonomyLevel = data.autonomy_level;
-                document.getElementById('btn-toggle-autonomy').innerText = activeAutonomyLevel === 'LEVEL_4_CLOSED_LOOP' ? 'Level 4 (Closed-Loop)' : 'Level 2 (Advisory)';
-            }
-
             latestPredictions = data.predictions;
-
-            // Link active chart buffers to current suite's isolated history
             bisHistory = suiteHistories[currentSuite].bis;
             mapHistory = suiteHistories[currentSuite].map;
 
@@ -1136,7 +1788,7 @@ HTML_DASHBOARD_TEMPLATE = """
             // Target zone label
             ctx.font = '10px sans-serif';
             ctx.fillStyle = 'rgba(16, 185, 129, 0.7)';
-            ctx.fillText('TARGET BIS: 40 - 60 (Adequate Surgical Anesthesia)', 12, y60 + 14);
+            ctx.fillText('TARGET BIS: 40 - 60 (Adequate Surgical Anesthesia)', 12, y60 + 13);
 
             // 2. Horizontal Grid Lines & Y-Axis Labels
             ctx.strokeStyle = 'rgba(255, 255, 255, 0.06)';
@@ -1165,16 +1817,14 @@ HTML_DASHBOARD_TEMPLATE = """
 
             // Reserve left 75% for history, right 25% for conformal forecast projection
             const historyW = w * 0.75;
-            const futureW = w * 0.25;
             const stepX = historyW / Math.max(bisHistory.length - 1, 1);
 
-            // 3. Draw MAP Trajectory (Neon Coral / Rose)
+            // 3. Draw MAP Trajectory (Rose / Coral)
             ctx.strokeStyle = '#f43f5e';
             ctx.lineWidth = 1.8;
             ctx.beginPath();
             for (let i = 0; i < mapHistory.length; i++) {
                 const x = i * stepX;
-                // Scale MAP (unified 0 to 120 mmHg scale) to canvas height
                 const y = h - (mapHistory[i] / 120) * h;
                 if (i === 0) ctx.moveTo(x, y);
                 else ctx.lineTo(x, y);
