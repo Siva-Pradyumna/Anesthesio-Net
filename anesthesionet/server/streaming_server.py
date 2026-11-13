@@ -883,11 +883,11 @@ HTML_DASHBOARD_TEMPLATE = """
         .timer-surgery { color: #38bdf8; }
         .timer-emergence { color: #c084fc; }
 
-        /* Main Workspace Layout */
+        /* Main Workspace Layout: 77% Left (Clinical Monitoring), 23% Right (Interactive Controls) */
         main {
             flex: 1;
             display: grid;
-            grid-template-columns: 1.42fr 1fr;
+            grid-template-columns: 3.3fr 1fr;
             gap: 8px;
             padding: 6px 12px;
             overflow: hidden;
@@ -909,6 +909,13 @@ HTML_DASHBOARD_TEMPLATE = """
             height: 100%;
             min-height: 0;
             overflow: hidden;
+        }
+        .bottom-rack-row {
+            display: grid;
+            grid-template-columns: 1.15fr 1fr;
+            gap: 6px;
+            flex-shrink: 0;
+            max-height: 155px;
         }
 
         /* Clinical Readiness Alert Banner */
@@ -1247,7 +1254,7 @@ HTML_DASHBOARD_TEMPLATE = """
     </div>
 
     <main>
-        <!-- LEFT COLUMN: Real-Time Waveform, Vitals, Alerts & Drug Ce Rack -->
+        <!-- LEFT COLUMN (77% Width): Real-Time Waveform, Vitals, Syringes & Safety/XAI -->
         <div class="col-left">
             <!-- Dynamic Clinical Readiness & Workflow Alert Banner -->
             <div id="readiness-banner" class="readiness-banner readiness-standby">
@@ -1295,48 +1302,98 @@ HTML_DASHBOARD_TEMPLATE = """
                 </div>
             </div>
 
-            <!-- Syringe Pump Infusion Array with LIVE EFFECT-SITE CONCENTRATIONS (Ce) -->
-            <div class="syringe-card">
-                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
-                    <div style="font-size: 0.76rem; font-weight: 700;">Automated Syringe Pump Infusion Array &amp; Live Drug Effect-Site Concentrations</div>
-                    <div style="font-size: 0.65rem; color: var(--text-muted);">MIMO-SAC Closed-Loop Infusion</div>
+            <!-- Bottom Row: Automated Syringes (Left) + Deterministic Safety & XAI (Right) -->
+            <div class="bottom-rack-row">
+                <!-- Syringe Pump Infusion Array with LIVE EFFECT-SITE CONCENTRATIONS (Ce) -->
+                <div class="syringe-card" style="margin: 0;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                        <div style="font-size: 0.74rem; font-weight: 700;">Automated Syringe Pump Rack &amp; Ce</div>
+                        <div style="font-size: 0.63rem; color: var(--text-muted);">MIMO-SAC Closed-Loop</div>
+                    </div>
+                    <div class="syringe-grid">
+                        <div class="syringe-item">
+                            <div>
+                                <div class="syringe-drug" style="color: #38bdf8;">Propofol (Hypnotic)</div>
+                                <div class="syringe-sub" id="ce-prop-txt">Ce: 0.00 µg/mL | Standby</div>
+                            </div>
+                            <div class="syringe-rate" id="rate-prop">0.00 <span style="font-size: 0.63rem; font-weight: 400;">mg/kg/h</span></div>
+                        </div>
+                        <div class="syringe-item">
+                            <div>
+                                <div class="syringe-drug" style="color: #a78bfa;">Remifentanil (Opioid)</div>
+                                <div class="syringe-sub" id="ce-remi-txt">Ce: 0.00 ng/mL | Standby</div>
+                            </div>
+                            <div class="syringe-rate" id="rate-remi">0.000 <span style="font-size: 0.63rem; font-weight: 400;">µg/kg/min</span></div>
+                        </div>
+                        <div class="syringe-item">
+                            <div>
+                                <div class="syringe-drug" style="color: #f43f5e;">Norepinephrine</div>
+                                <div class="syringe-sub" id="sub-norepi">Preload Guarded</div>
+                            </div>
+                            <div class="syringe-rate" id="rate-norepi">0.000 <span style="font-size: 0.63rem; font-weight: 400;">µg/kg/min</span></div>
+                        </div>
+                    </div>
                 </div>
-                <div class="syringe-grid">
-                    <div class="syringe-item">
-                        <div>
-                            <div class="syringe-drug" style="color: #38bdf8;">Propofol (Hypnotic)</div>
-                            <div class="syringe-sub" id="ce-prop-txt">Ce: 0.00 µg/mL | Standby</div>
+
+                <!-- Safety Guardrails & Explainable AI (XAI) -->
+                <div class="panel-card" style="margin: 0; display: flex; flex-direction: column; justify-content: space-between;">
+                    <div>
+                        <div style="font-size: 0.74rem; font-weight: 700; margin-bottom: 3px; display: flex; justify-content: space-between;">
+                            <span>Safety Guardrails</span>
+                            <span style="font-size: 0.64rem; color: var(--green);">IEC 60601-1-10</span>
                         </div>
-                        <div class="syringe-rate" id="rate-prop">0.00 <span style="font-size: 0.65rem; font-weight: 400;">mg/kg/h</span></div>
+                        <div class="safety-grid">
+                            <div>• <b>Autonomy:</b> <span id="autonomy-txt" style="color: var(--green);">Level 4 Closed-Loop</span></div>
+                            <div>• <b>HOCBF QP:</b> <span id="hocbf-txt" style="color: var(--green);">ACTIVE (Forward Invariance)</span></div>
+                            <div>• <b>Watchdog:</b> <span id="watchdog-txt" style="color: var(--green);">NORMAL (&lt;500ms)</span></div>
+                            <div>• <b>Signal SQI:</b> <span id="signal-txt" style="color: var(--green);">SQI 98% (CLEAN)</span></div>
+                        </div>
+                        <div id="preload-txt" style="font-size: 0.67rem; color: #fbbf24; margin-top: 2px; font-weight: 600;">
+                            Preload Gate: Normovolemic (PPV &lt; 13%)
+                        </div>
                     </div>
-                    <div class="syringe-item">
-                        <div>
-                            <div class="syringe-drug" style="color: #a78bfa;">Remifentanil (Opioid)</div>
-                            <div class="syringe-sub" id="ce-remi-txt">Ce: 0.00 ng/mL | Standby</div>
+
+                    <div style="border-top: 1px solid var(--border); padding-top: 2px; margin-top: 2px;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 2px;">
+                            <span style="font-size: 0.72rem; font-weight: 700;">Explainable AI (XAI) Attribution</span>
+                            <span style="font-size: 0.65rem; color: var(--blue);" id="xai-driver">Synergistic Titration</span>
                         </div>
-                        <div class="syringe-rate" id="rate-remi">0.000 <span style="font-size: 0.65rem; font-weight: 400;">µg/kg/min</span></div>
-                    </div>
-                    <div class="syringe-item">
-                        <div>
-                            <div class="syringe-drug" style="color: #f43f5e;">Norepinephrine (Pressor)</div>
-                            <div class="syringe-sub" id="sub-norepi">Preload Guarded | SVR</div>
+                        <div class="xai-bar-wrap">
+                            <span style="width: 110px; color: var(--text-muted); font-size: 0.67rem;">Conformal MAP Risk:</span>
+                            <div class="xai-bar-track">
+                                <div class="xai-bar-fill" id="xai-bar-map" style="width: 25%; background: #f43f5e;"></div>
+                            </div>
+                            <span style="width: 28px; text-align: right; font-weight: 700; color: #f43f5e; font-size: 0.67rem;" id="xai-val-map">25%</span>
                         </div>
-                        <div class="syringe-rate" id="rate-norepi">0.000 <span style="font-size: 0.65rem; font-weight: 400;">µg/kg/min</span></div>
+                        <div class="xai-bar-wrap">
+                            <span style="width: 110px; color: var(--text-muted); font-size: 0.67rem;">BIS Depth Error:</span>
+                            <div class="xai-bar-track">
+                                <div class="xai-bar-fill" id="xai-bar-bis" style="width: 20%; background: #38bdf8;"></div>
+                            </div>
+                            <span style="width: 28px; text-align: right; font-weight: 700; color: #38bdf8; font-size: 0.67rem;" id="xai-val-bis">20%</span>
+                        </div>
+                        <div class="xai-bar-wrap">
+                            <span style="width: 110px; color: var(--text-muted); font-size: 0.67rem;">Nociception Surge:</span>
+                            <div class="xai-bar-track">
+                                <div class="xai-bar-fill" id="xai-bar-pain" style="width: 10%; background: #fbbf24;"></div>
+                            </div>
+                            <span style="width: 28px; text-align: right; font-weight: 700; color: #fbbf24; font-size: 0.67rem;" id="xai-val-pain">10%</span>
+                        </div>
                     </div>
                 </div>
             </div>
         </div>
 
-        <!-- RIGHT COLUMN: Lifecycle Toolbar, Challenge Console & Safety Guardrails -->
+        <!-- RIGHT COLUMN (23% Width): Dedicated Interactive Operator Control Console -->
         <div class="col-right">
             <!-- Panel 1: Clinical Lifecycle Orchestration Toolbar -->
             <div class="panel-card" style="flex-shrink: 0;">
-                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;">
-                    <span style="font-size: 0.78rem; font-weight: 700;">Clinical Lifecycle Orchestration</span>
-                    <span style="font-size: 0.65rem; color: var(--blue);" id="lifecycle-phase-tag">PHASE: STANDBY</span>
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                    <span style="font-size: 0.78rem; font-weight: 700;">Operator Action Console</span>
+                    <span style="font-size: 0.64rem; color: var(--blue);" id="lifecycle-phase-tag">PHASE: STANDBY</span>
                 </div>
 
-                <div class="lifecycle-btn-grid">
+                <div class="lifecycle-btn-grid" style="grid-template-columns: 1fr; gap: 5px;">
                     <button class="action-btn btn-induction" id="btn-start-induction" onclick="sendAction('start_induction')">
                         ▶ 1. Start Induction
                     </button>
@@ -1350,92 +1407,63 @@ HTML_DASHBOARD_TEMPLATE = """
                         ▶ 4. Start Emergence
                     </button>
                 </div>
-                <div style="display: flex; justify-content: flex-end;">
-                    <button class="action-btn btn-reset" style="padding: 3px 10px; font-size: 0.68rem;" onclick="sendAction('reset_standby')">
+                <div style="display: flex; justify-content: flex-end; margin-top: 4px;">
+                    <button class="action-btn btn-reset" style="padding: 3px 8px; font-size: 0.66rem; width: 100%;" onclick="sendAction('reset_standby')">
                         🔄 Reset Suite to Standby
                     </button>
                 </div>
             </div>
 
-            <!-- Panel 2: Interactive Stress Challenges & Autonomous Recovery Console -->
-            <div class="panel-card" style="flex-shrink: 0;">
-                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;">
-                    <span style="font-size: 0.78rem; font-weight: 700;">Intraoperative Challenges &amp; Stress Testing</span>
-                    <span style="font-size: 0.65rem; color: var(--text-muted);" id="challenges-active-hint">(Active During Surgery)</span>
-                </div>
-
-                <div class="stress-grid">
-                    <button class="ctrl-btn ctrl-btn-pain" id="btn-pain" onclick="sendAction('pain', {value: 0.85})" disabled>
-                        ⚡ Incision Surge (+0.85)
-                    </button>
-                    <button class="ctrl-btn ctrl-btn-crash" id="btn-hypo" onclick="sendAction('hypotension', {value: 20.0})" disabled>
-                        📉 MAP Crash (-20 mmHg)
-                    </button>
-                    <button class="ctrl-btn ctrl-btn-bolus" id="btn-preload" onclick="sendAction('preload_deficit', {})" disabled>
-                        💧 Preload Deficit (PPV 16%)
-                    </button>
-                    <button class="ctrl-btn ctrl-btn-bolus" id="btn-bolus" onclick="sendAction('bolus', {})" disabled>
-                        💧 250mL Fluid Bolus
-                    </button>
-                    <button class="ctrl-btn ctrl-btn-bovie" id="btn-bovie" onclick="sendAction('artifact', {duration: 6.0})" disabled>
-                        📻 Electrocautery (Bovie)
-                    </button>
-                    <button class="ctrl-btn ctrl-btn-light" id="btn-light" onclick="sendAction('lightening', {})" disabled>
-                        ⚠️ Lightening Depth (+25)
-                    </button>
-                </div>
-
-                <!-- Live Auto-Recovery Status Card -->
-                <div class="section-label">AUTONOMOUS CLOSED-LOOP RECOVERY FEED:</div>
-                <div class="recovery-feed" id="recovery-feed">
-                    <div id="recovery-feed-title" style="font-weight: 700; color: #94a3b8;">No active stress challenges. Closed-loop baseline stable.</div>
-                    <div id="recovery-feed-detail" style="font-size: 0.65rem; color: #64748b;">Operator can inject hemodynamic or surgical perturbations during maintenance.</div>
-                </div>
-            </div>
-
-            <!-- Panel 3: Safety Guardrails & Explainable AI (XAI) -->
+            <!-- Panel 2: Interactive Stress Challenges -->
             <div class="panel-card" style="flex: 1; min-height: 0; display: flex; flex-direction: column; justify-content: space-between;">
                 <div>
-                    <div style="font-size: 0.78rem; font-weight: 700; margin-bottom: 4px; display: flex; justify-content: space-between;">
-                        <span>Deterministic Safety &amp; Guardrails</span>
-                        <span style="font-size: 0.65rem; color: var(--green);">IEC 60601-1-10</span>
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;">
+                        <span style="font-size: 0.76rem; font-weight: 700;">Intraoperative Challenges</span>
+                        <span style="font-size: 0.62rem; color: var(--text-muted);" id="challenges-active-hint">(Active in Surgery)</span>
                     </div>
-                    <div class="safety-grid">
-                        <div>• <b>Autonomy:</b> <span id="autonomy-txt" style="color: var(--green);">Level 4 Closed-Loop</span></div>
-                        <div>• <b>HOCBF QP:</b> <span id="hocbf-txt" style="color: var(--green);">FORWARD INVARIANCE</span></div>
-                        <div>• <b>Watchdog:</b> <span id="watchdog-txt" style="color: var(--green);">HEARTBEAT NORMAL</span></div>
-                        <div>• <b>Signal SQI:</b> <span id="signal-txt" style="color: var(--green);">SQI 98% (CLEAN)</span></div>
+
+                    <div class="stress-grid" style="grid-template-columns: 1fr; gap: 4px;">
+                        <button class="ctrl-btn ctrl-btn-pain" id="btn-pain" onclick="sendAction('pain', {value: 0.85})" disabled>
+                            ⚡ Incision Surge (+0.85)
+                        </button>
+                        <button class="ctrl-btn ctrl-btn-crash" id="btn-hypo" onclick="sendAction('hypotension', {value: 20.0})" disabled>
+                            📉 MAP Crash (-20 mmHg)
+                        </button>
+                        <button class="ctrl-btn ctrl-btn-bolus" id="btn-preload" onclick="sendAction('preload_deficit', {})" disabled>
+                            💧 Preload Deficit (PPV 16%)
+                        </button>
+                        <button class="ctrl-btn ctrl-btn-bolus" id="btn-bolus" onclick="sendAction('bolus', {})" disabled>
+                            💧 250mL Fluid Bolus
+                        </button>
+                        <button class="ctrl-btn ctrl-btn-bovie" id="btn-bovie" onclick="sendAction('artifact', {duration: 6.0})" disabled>
+                            📻 Electrocautery (Bovie)
+                        </button>
+                        <button class="ctrl-btn ctrl-btn-light" id="btn-light" onclick="sendAction('lightening', {})" disabled>
+                            ⚠️ Lightening Depth (+25)
+                        </button>
                     </div>
-                    <div id="preload-txt" style="font-size: 0.68rem; color: #fbbf24; margin-top: 4px; font-weight: 600;">
-                        Preload Gate: Normovolemic (PPV &lt; 13%)
+
+                    <!-- Live Auto-Recovery Status Card -->
+                    <div class="section-label" style="margin-top: 5px;">CLOSED-LOOP RECOVERY FEED:</div>
+                    <div class="recovery-feed" id="recovery-feed">
+                        <div id="recovery-feed-title" style="font-weight: 700; color: #94a3b8; font-size: 0.68rem;">Closed-loop baseline stable.</div>
+                        <div id="recovery-feed-detail" style="font-size: 0.62rem; color: #64748b;">Operator can inject stress challenges during maintenance.</div>
                     </div>
                 </div>
 
-                <div style="border-top: 1px solid var(--border); padding-top: 4px; margin-top: 4px;">
-                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 3px;">
-                        <span style="font-size: 0.74rem; font-weight: 700;">Event-Triggered Explainable AI (XAI)</span>
-                        <span style="font-size: 0.65rem; color: var(--blue);" id="xai-driver">Synergistic Titration</span>
+                <!-- Mode & Autonomy Toggles -->
+                <div style="border-top: 1px solid var(--border); padding-top: 5px; margin-top: 5px; display: flex; flex-direction: column; gap: 4px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <span style="font-size: 0.67rem; color: var(--text-muted);">Mode:</span>
+                        <button class="ctrl-btn" id="btn-toggle-mode" style="padding: 2px 8px; font-size: 0.65rem;" onclick="toggleEngineMode()">
+                            Mode A (Digital Twin Sim)
+                        </button>
                     </div>
-                    <div class="xai-bar-wrap">
-                        <span style="width: 120px; color: var(--text-muted); font-size: 0.68rem;">Conformal MAP Risk:</span>
-                        <div class="xai-bar-track">
-                            <div class="xai-bar-fill" id="xai-bar-map" style="width: 25%; background: #f43f5e;"></div>
-                        </div>
-                        <span style="width: 30px; text-align: right; font-weight: 700; color: #f43f5e; font-size: 0.68rem;" id="xai-val-map">25%</span>
-                    </div>
-                    <div class="xai-bar-wrap">
-                        <span style="width: 120px; color: var(--text-muted); font-size: 0.68rem;">BIS Error Deviation:</span>
-                        <div class="xai-bar-track">
-                            <div class="xai-bar-fill" id="xai-bar-bis" style="width: 20%; background: #38bdf8;"></div>
-                        </div>
-                        <span style="width: 30px; text-align: right; font-weight: 700; color: #38bdf8; font-size: 0.68rem;" id="xai-val-bis">20%</span>
-                    </div>
-                    <div class="xai-bar-wrap">
-                        <span style="width: 120px; color: var(--text-muted); font-size: 0.68rem;">Surgical Nociception:</span>
-                        <div class="xai-bar-track">
-                            <div class="xai-bar-fill" id="xai-bar-pain" style="width: 10%; background: #fbbf24;"></div>
-                        </div>
-                        <span style="width: 30px; text-align: right; font-weight: 700; color: #fbbf24; font-size: 0.68rem;" id="xai-val-pain">10%</span>
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <span style="font-size: 0.67rem; color: var(--text-muted);">Autonomy:</span>
+                        <button class="ctrl-btn" id="btn-toggle-autonomy" style="padding: 2px 8px; font-size: 0.65rem;" onclick="toggleAutonomy()">
+                            Level 4 (Closed-Loop)
+                        </button>
                     </div>
                 </div>
             </div>
@@ -1567,6 +1595,23 @@ HTML_DASHBOARD_TEMPLATE = """
             } catch(e) {
                 console.error('Action dispatch failed:', e);
             }
+        }
+
+        let activeEngineMode = 'MODE_A_SIMULATOR';
+        let activeAutonomyLevel = 'LEVEL_4_CLOSED_LOOP';
+
+        function toggleEngineMode() {
+            activeEngineMode = (activeEngineMode === 'MODE_A_SIMULATOR') ? 'MODE_B_REPLAY' : 'MODE_A_SIMULATOR';
+            const btn = document.getElementById('btn-toggle-mode');
+            if (btn) btn.innerText = (activeEngineMode === 'MODE_A_SIMULATOR') ? 'Mode A (Digital Twin Sim)' : 'Mode B (VitalDB Replay)';
+            sendAction('mode', { mode: activeEngineMode });
+        }
+
+        function toggleAutonomy() {
+            activeAutonomyLevel = (activeAutonomyLevel === 'LEVEL_4_CLOSED_LOOP') ? 'LEVEL_2_ADVISORY' : 'LEVEL_4_CLOSED_LOOP';
+            const btn = document.getElementById('btn-toggle-autonomy');
+            if (btn) btn.innerText = (activeAutonomyLevel === 'LEVEL_4_CLOSED_LOOP') ? 'Level 4 (Closed-Loop)' : 'Level 2 (Advisory)';
+            sendAction('autonomy', { level: activeAutonomyLevel });
         }
 
         function switchSuite(suite) {
@@ -1753,6 +1798,17 @@ HTML_DASHBOARD_TEMPLATE = """
                 document.getElementById('xai-val-bis').innerText = `${data.xai.bis_error_pct.toFixed(0)}%`;
                 document.getElementById('xai-bar-pain').style.width = `${data.xai.nociception_pct}%`;
                 document.getElementById('xai-val-pain').innerText = `${data.xai.nociception_pct.toFixed(0)}%`;
+            }
+
+            if (data.mode) {
+                activeEngineMode = data.mode;
+                const btnM = document.getElementById('btn-toggle-mode');
+                if (btnM) btnM.innerText = (activeEngineMode === 'MODE_A_SIMULATOR') ? 'Mode A (Digital Twin Sim)' : 'Mode B (VitalDB Replay)';
+            }
+            if (data.autonomy_level) {
+                activeAutonomyLevel = data.autonomy_level;
+                const btnA = document.getElementById('btn-toggle-autonomy');
+                if (btnA) btnA.innerText = (activeAutonomyLevel === 'LEVEL_4_CLOSED_LOOP') ? 'Level 4 (Closed-Loop)' : 'Level 2 (Advisory)';
             }
 
             latestPredictions = data.predictions;
