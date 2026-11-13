@@ -9,7 +9,8 @@ import asyncio
 from datetime import datetime
 import json
 from typing import Dict
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket
+from starlette.websockets import WebSocketDisconnect, WebSocketState
 from fastapi.responses import HTMLResponse
 import numpy as np
 
@@ -300,17 +301,23 @@ def create_app() -> FastAPI:
         await websocket.accept()
         suite = suites.get(suite_id, suites["OR-1"])
         try:
-            while True:
+            while websocket.client_state == WebSocketState.CONNECTED:
                 try:
                     payload = suite.step()
                     await websocket.send_text(json.dumps(payload, default=float))
+                except (WebSocketDisconnect, RuntimeError):
+                    break
                 except Exception as step_err:
+                    if "close" in str(step_err).lower():
+                        break
                     print(f"[WebSocket Error] Suite {suite_id}: {step_err}")
+                    break
                 await asyncio.sleep(0.5)  # 2 Hz telemetry broadcast
         except WebSocketDisconnect:
             pass
         except Exception as ws_err:
-            print(f"[WebSocket Fatal] Suite {suite_id}: {ws_err}")
+            if "close" not in str(ws_err).lower():
+                print(f"[WebSocket Notice] Suite {suite_id} disconnected: {ws_err}")
 
     return app
 
